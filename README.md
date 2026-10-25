@@ -1,1 +1,48 @@
 # PowerApp
+
+An installable web app for [PowerDesk](https://github.com/PawelW2201/PowerDesk), a personal project for learning
+how European power markets work on public data.
+
+- **Today** shows the day-ahead brief PowerDesk builds three times a day: base, peak and off-peak prices for 13
+  bidding zones, Germany's price curve against its residual load (load minus wind and solar), and where the day
+  sits on the last two weeks' supply curve.
+- **Products** works on its own, without a token: delivery hours for any standard product (Cal27, Q1-27, Nov26,
+  Wk45, WE, BOM, DA…), base, peak and off-peak, clock changes included, and what a price move is worth on a
+  position. Polish products follow TGE's PEAK5 (07–22 on working days); the rest follow EEX (Mon–Fri 08–20).
+
+This repository holds **only the app's code**. It contains no data: when you open Today, the app reads
+`summary.json` from the `dashboard-data` branch of your private PowerDesk repository, straight from GitHub's API,
+with a read-only token you paste once per device. Some of that data is licensed for private use only, which is
+why it never lives here.
+
+## Set up
+
+1. Open the app's GitHub Pages address on your computer or phone.
+2. On Today, tap **Create a read-only token**. On GitHub, set *Repository access* to *Only select repositories*
+   and pick PowerDesk. *Contents: Read-only* is already filled in. Generate the token and copy it.
+3. Paste it and tap **Connect**.
+
+To install it: in Chrome or Edge use *Install app*; on Android use *Add to Home screen*; on iPhone use Safari's
+*Share → Add to Home Screen*. Settings has a setup link and QR code to connect another device without a new token.
+
+## Privacy
+
+- The token stays in this browser's storage and is only ever sent to `api.github.com`.
+- The last brief is kept on the device so the app opens offline. Settings → *Disconnect this device* removes both.
+- Phone pushes come from PowerDesk's workflow through [ntfy](https://ntfy.sh) once its `NTFY_TOPIC` secret exists.
+
+## Files
+
+| File | What it is |
+|---|---|
+| `index.html` | Page shell and styles |
+| `app.js` | The app: connecting, Today, zone sheets, Products, settings |
+| `calendar.js` | Delivery hours of standard products; a port of PowerDesk's `powerdesk/products.py` |
+| `charts.js` | Small SVG charts: step lines for prices and load, a scatter for price against residual load |
+| `sw.js` | Offline copy of the app's own files (never touches GitHub data requests) |
+| `manifest.webmanifest`, `icons/` | Install metadata and icons |
+| `fonts/` | Barlow and Barlow Semi Condensed, SIL Open Font License 1.1 (`fonts/OFL-Barlow.txt`) |
+| `vendor/qrcode.mjs` | QR Code Generator for JavaScript by Kazuhiko Arase, MIT license (header in the file) |
+| `tests/` | Checks `calendar.js` against 1,050 cases made from the Python reference (`node --test tests/calendar.test.mjs`) |
+
+No build step: GitHub Pages serves these files as they are.

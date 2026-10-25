@@ -1,0 +1,9 @@
+{
+  "name": "powerapp",
+  "private": true,
+  "type": "module",
+  "description": "Installable web app for PowerDesk. No build step; this file only tells Node the code is ES modules for the tests.",
+  "scripts": {
+    "test": "node --test tests/calendar.test.mjs"
+  }
+}
