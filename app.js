@@ -1,14 +1,15 @@
 // app.js — PowerApp. Products works on its own; Today reads PowerDesk's summary.json
 // from the private repo's dashboard-data branch with a read-only token.
-import { stepChart, scatterChart, crosshairGroup, legend, fmtClock } from "./charts.js";
-import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, weekday, baseHours, isHoliday, MONTH_ABBR } from "./calendar.js";
+import { stepChart, scatterChart, lineChart, crosshairGroup, legend, fmtClock } from "./charts.js";
+import * as opt from "./options.js";
+import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, weekday, baseHours, isHoliday, zonedToUtc, MONTH_ABBR } from "./calendar.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const STORE = "powerapp.v1";
 const DATA_CACHE = "pa-data-v1";
 const DEFAULT_BRANCH = "dashboard-data";
 const RAW = "application/vnd.github.raw+json";
-const TABS = ["today", "products"];
+const TABS = ["today", "products", "options"];
 const TZ = "Europe/Berlin";
 const C = { price: "var(--s-1)", residual: "var(--s-2)", renew: "var(--s-3)", load: "var(--s-load)", hist: "var(--s-hist)", sel: "var(--ink)" };
 const WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -177,7 +178,7 @@ function render() {
   const main = h("main", { id: "view", tabindex: "-1" });
   app.replaceChildren(rail(), h("div", { class: "main-col" }, topbar(), h("div", { id: "status" }), main), tabbar());
   renderStatus();
-  const view = { today: viewToday, products: viewProducts }[state.tab];
+  const view = { today: viewToday, products: viewProducts, options: viewOptions }[state.tab];
   try { main.appendChild(view()); }
   catch (e) { console.error(e); main.appendChild(h("p", { class: "empty", text: `This view couldn't be drawn: ${e.message}` })); }
   const sy = state.ui[`scroll:${state.tab}`];
@@ -188,10 +189,11 @@ function render() {
 function brand() {
   return h("span", { class: "brand" }, h("img", { src: "icons/icon.svg", alt: "", width: 26, height: 26 }), h("span", { class: "brand-name", text: "PowerApp" }));
 }
-const TAB_LABEL = { today: "Today", products: "Products" };
+const TAB_LABEL = { today: "Today", products: "Products", options: "Options" };
 const TAB_ICON = {
   today: "M3 17h3v-4h3v-6h3v9h3v-5h3v3h3",
   products: "M4 5h16v14H4zM4 10h16M9 10v9M14 10v9",
+  options: "M3 15h8l9-9M3 20h18",
 };
 function navIcon(d) {
   const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -558,6 +560,213 @@ function conventions(market) {
       h("li", null, h("b", { text: "X at Y" }), " is bid at offer. \"Mine\" lifts the offer, \"yours\" hits the bid; \"paid\" and \"given\" say it traded there. \"In 5\" is 5 MW."),
       h("li", null, h("b", { text: "Peak" }), ` in ${market.name} means ${market.peak.holidays ? "07:00–22:00 on Polish working days (TGE PEAK5)" : "Monday–Friday 08:00–20:00, public holidays included (EEX)"}. Off-peak is every other hour.`),
       h("li", null, h("b", { text: "Hours" }), " are real elapsed hours: the day the clocks go forward has 23, the day they go back has 25.")));
+}
+
+// ------------------------------------------------------------------ Options
+const YEAR_MS = 365 * 86400000;
+const OPT_DEFAULTS = {
+  model: "black", F: "85", K: "90", days: "60", vol: "40", volN: "34", rate: "0", product: "Q1-27", market: "DE", mw: "1", seen: "", chartKind: "call",
+  month: "", mF: "90", mK: "100", mKind: "call", sl: "35", ss: "120", hl: "5", rho: "0",
+  pF: "95", pGas: "35", hr: "1.9", eua: "70", ef: "0.37", vom: "2", pVol: "45", gVol: "50", pRho: "0.8", pDays: "30",
+};
+const optCfg = () => ({ ...OPT_DEFAULTS, ...(cfg.options || {}) });
+const saveOpt = (patch) => saveCfg({ options: { ...optCfg(), ...patch } });
+const p3 = (v) => (v == null ? "—" : neg(new Intl.NumberFormat("en-US", { minimumFractionDigits: 3, maximumFractionDigits: 3 }).format(v), v));
+const dec = (x) => parseFloat(String(x ?? "").trim().replace(",", "."));   // "0,25" works too
+const pct = (v, d = 1) => `${new Intl.NumberFormat("en-US", { maximumFractionDigits: d }).format(v * 100)}%`;
+const sig3 = (v) => (v == null || !isFinite(v) ? "—" : neg(new Intl.NumberFormat("en-US", { maximumSignificantDigits: 3 }).format(v), v));
+const defaultMonth = () => strip(todayIn(TZ))[1];
+function debounce(fn, ms) { let t; return () => { clearTimeout(t); t = setTimeout(fn, ms); }; }
+
+function optField(label, key, onChange, hint) {
+  return h("label", { class: "field" }, h("span", { text: label }),
+    h("input", { class: "input", type: "text", inputmode: "decimal", value: optCfg()[key], autocomplete: "off", spellcheck: "false",
+      placeholder: hint || null, oninput: (e) => { saveOpt({ [key]: e.target.value }); onChange(); } }));
+}
+const warnOut = (out, text) => out.replaceChildren(h("p", { class: "warn-text", text }));
+
+function viewOptions() {
+  return h("div", { class: "options" },
+    section("opt-head", kicker("Options on power futures"), h("h1", { class: "headline", text: "Options" }),
+      h("p", { class: "lede", text: "Everything here is priced on futures, so there's no carry: just the future, the strike, time and volatility. Prices are in €/MWh; type 0,25 or 0.25, either works." })),
+    vanillaSection(), monthSection(), spreadSection());
+}
+
+// --- an option on a future
+function vanillaSection() {
+  const out = h("div", { class: "opt-out", "aria-live": "polite" });
+  const chartBox = h("div", { class: "chart-box" });
+  const o0 = optCfg(), black0 = o0.model === "black";
+  const draw = () => {
+    const o = optCfg(), black = o.model === "black";
+    const F = dec(o.F), K = dec(o.K), T = dec(o.days) / 365, r = dec(o.rate || 0) / 100;
+    const vol = black ? dec(o.vol) / 100 : dec(o.volN);
+    chartBox.replaceChildren();
+    if (![F, K, T, vol, r].every(isFinite) || T < 0 || vol < 0) return warnOut(out, "Fill in the future, strike, days and vol with numbers.");
+    if (black && (F <= 0 || K <= 0)) return warnOut(out, "Black-76 needs a positive future and strike. For spreads or negative prices, switch to Bachelier.");
+    const greeks = (kind) => (black ? opt.black76Greeks(F, K, T, vol, r, kind) : opt.bachelierGreeks(F, K, T, vol, r, kind));
+    const c = greeks("call"), p = greeks("put");
+    const vega = (g) => (black ? g.vega / 100 : g.vega);
+    const row = (name, g) => h("tr", null, h("th", { scope: "row", text: name }), num(p2(g.price)), num(sig3(g.delta)), num(sig3(g.gamma), "wide"), num(sig3(vega(g))), num(sig3(g.theta / 365)));
+    const kids = [
+      table(["", "Premium", "Delta", h("th", { class: "wide", text: "Gamma" }), "Vega", "Theta / day"], [row("Call", c), row("Put", p)], { caption: "Premiums and greeks" }),
+      h("p", { class: "note", text: `Vega is the premium change ${black ? "for one vol point" : "for 1 €/MWh of normal vol"}; theta is what a day costs if nothing else moves.` }),
+    ];
+    try {
+      const d = delivery(o.product, o.market), mw = dec(o.mw);
+      if (isFinite(mw) && mw > 0) kids.push(h("p", { class: "lede", text: `On ${upTo2.format(mw)} MW of ${d.period.label} base (${int(d.hours.base)} hours in ${o.market}), the call costs ${eur(c.price * d.hours.base * mw)} and the put ${eur(p.price * d.hours.base * mw)}.` }));
+    } catch (e) { kids.push(h("p", { class: "note", text: `Product: ${e.message}` })); }
+    const seen = dec(o.seen);
+    if (isFinite(seen)) {
+      let text;
+      try {
+        const iv = black ? opt.black76Iv(seen, F, K, T, r, "call") : opt.bachelierIv(seen, F, K, T, r, "call");
+        text = black ? `A call premium of ${p2(seen)} means the market is pricing ${pct(iv)} vol.` : `A call premium of ${p2(seen)} means a normal vol of ${p2(iv)} €/MWh.`;
+      } catch (e) { text = e.message; }
+      kids.push(h("p", { class: "lede", text }));
+    }
+    out.replaceChildren(...kids);
+
+    // value now and at expiry, against the future
+    const kind = o.chartKind === "put" ? "put" : "call", w = kind === "call" ? 1 : -1;
+    const spread = black ? null : 3 * vol * Math.sqrt(Math.max(T, 1 / 365));
+    const lo = black ? F * 0.4 : F - spread, hi = black ? F * 1.6 : F + spread;
+    const xs = Array.from({ length: 161 }, (_, i) => lo + ((hi - lo) * i) / 160);
+    const price = (f) => (black ? (f > 0 ? opt.black76(f, K, T, vol, r, kind) : null) : opt.bachelier(f, K, T, vol, r, kind));
+    chartBox.append(h("div", { class: "filters" }, seg("Option", [{ value: "call", label: "Call" }, { value: "put", label: "Put" }], kind,
+      (v) => { saveOpt({ chartKind: v }); draw(); })));
+    lineChart(chartBox, {
+      x: xs, xFmt: tick, xName: "Future at", fmt: p2, tickFmt: tick, height: 170, zero: true, xTitle: "Future, €/MWh",
+      series: [
+        { name: "Value now", values: xs.map(price), color: C.price },
+        { name: "At expiry", values: xs.map((f) => Math.exp(-r * T) * Math.max(w * (f - K), 0)), color: C.load },
+      ],
+      marks: [{ x: F, label: `F ${tick(F)}` }, ...(Math.abs(K - F) > 1e-9 ? [{ x: K, label: `K ${tick(K)}` }] : [])],
+      label: `${kind} value against the future price, now and at expiry`,
+    });
+    chartBox.appendChild(legend([{ name: "Value now", color: C.price }, { name: "Payoff at expiry", color: C.load }]));
+  };
+  const marketSel = h("select", { class: "select", "aria-label": "Market", onchange: (e) => { saveOpt({ market: e.target.value }); draw(); } },
+    Object.values(MARKETS).sort((a, b) => a.name.localeCompare(b.name)).map((m) => h("option", { value: m.code, selected: m.code === o0.market || null }, m.code)));
+  const sec = section("opt-vanilla",
+    h("h2", { class: "h2", text: "Option on a future" }),
+    h("p", { class: "note", text: "EEX's month, quarter and year options are European options on the future: Black-76. Bachelier assumes normal moves instead, which suits spreads and anything that can go negative." }),
+    h("div", { class: "filters" }, seg("Model", [{ value: "black", label: "Black-76" }, { value: "bachelier", label: "Bachelier" }], o0.model,
+      (v) => { saveOpt({ model: v }); render(); })),
+    h("div", { class: "form-grid even" },
+      optField("Future, €/MWh", "F", draw), optField("Strike, €/MWh", "K", draw), optField("Days to expiry", "days", draw),
+      black0 ? optField("Vol, %", "vol", draw) : optField("Normal vol, €/MWh", "volN", draw),
+      optField("Rate, %", "rate", draw, "0 for EEX"), optField("Premium you saw (call)", "seen", draw, "optional"),
+      optField("Product", "product", draw), h("label", { class: "field" }, h("span", { text: "Market" }), marketSel), optField("Size, MW", "mw", draw)),
+    out, chartBox);
+  draw();
+  return sec;
+}
+
+// --- a delivery month: European on the future vs Asian on the fixings
+function monthSection() {
+  const out = h("div", { class: "opt-out", "aria-live": "polite" });
+  const chartBox = h("div", { class: "chart-box" });
+  const o0 = optCfg();
+  const draw = () => {
+    const o = optCfg();
+    chartBox.replaceChildren();
+    const F = dec(o.mF), K = dec(o.mK), sl = dec(o.sl) / 100, ss = dec(o.ss) / 100, hl = dec(o.hl), rho = dec(o.rho);
+    if (![F, K, sl, ss, hl, rho].every(isFinite) || F <= 0 || K <= 0 || sl < 0 || ss < 0 || hl <= 0 || Math.abs(rho) > 1)
+      return warnOut(out, "Fill in every field: positive forward, strike, vols and half-life, and a correlation between −1 and 1.");
+    let d;
+    try { d = delivery(o.month || defaultMonth(), "DE"); } catch (e) { return warnOut(out, e.message); }
+    if (d.period.kind !== "Month") return warnOut(out, `Pick a month, like ${defaultMonth()}.`);
+    // The month option expires on the last weekday at least two days before delivery, at noon.
+    let expN = d.period.start - 2;
+    while (weekday(expN) > 4) expN--;
+    const start = (d.startUtc - Date.now()) / YEAR_MS, days = d.period.days;
+    const expiry = (zonedToUtc(expN, 12, TZ) - Date.now()) / YEAR_MS;
+    if (expiry < 1 / 365) return warnOut(out, `${d.period.label} is too close: its month option would already have expired. Pick a later month.`);
+    const kind = o.mKind === "put" ? "put" : "call";
+    const model = opt.TwoFactor.fromHalfLife(ss, hl, sl, rho);
+    const res = opt.monthOptions(model, F, K, start, days, expiry, 0, kind);
+    const mc = opt.asianMc(res.forwards, res.fixingCov, K, res.end, 0, kind, 20000, 7);
+    const expDay = isoDate(expN);
+    const share = res.vFuture / res.vAverage;
+    const sdF = res.mean * Math.sqrt(Math.expm1(res.vFuture)), sdA = res.mean * Math.sqrt(Math.expm1(res.vAverage));
+    const row = (name, sub, value) => h("tr", null, h("th", { scope: "row" }, name, sub ? h("span", { class: "zn", text: sub }) : null), num(value));
+    out.replaceChildren(
+      table(["", "Premium"], [
+        row("European on the month future", `expires ${dayName(expDay, true)}, at ${pct(res.futureVol)} implied vol`, p3(res.european)),
+        row("Asian on the daily fixings", "moment matching", p3(res.asian)),
+        row("Asian, Monte Carlo", "20,000 paths, geometric control variate", `${p3(mc.price)} ± ${p3(mc.stderr)}`),
+        row("…without the control variate", "same paths", `${p3(mc.plain)} ± ${p3(mc.plainStderr)}`),
+      ], { cls: "opt-tbl", caption: `${d.period.label} ${kind}s, strike ${p2(K)}` }),
+      h("p", { class: "lede", text: `${pct(share, 0)} of the uncertainty in ${d.period.label}'s average builds up before delivery and ${pct(1 - share, 0)} during it. One standard deviation: ±${p2(sdF)} €/MWh for the month future at expiry, ±${p2(sdA)} for the realised average. The Asian is worth more because it carries the delivery days too.` }));
+
+    // the Samuelson effect: how volatile a forward is, by time to delivery
+    const startDays = start * 365, maxDays = Math.max(120, Math.ceil(startDays / 30) * 30 + 30);
+    const xs = Array.from({ length: 241 }, (_, i) => (maxDays * i) / 240);
+    chartBox.appendChild(h("h3", { class: "h3", text: "Volatility of a forward, by days to its delivery" }));
+    lineChart(chartBox, {
+      x: xs, xFmt: (v) => nf0.format(v), xName: "Days to delivery", fmt: (v) => pct(v / 100), tickFmt: (v) => `${nf0.format(v)}%`, height: 150, zero: true,
+      series: [{ name: "Forward vol", values: xs.map((x) => 100 * model.forwardVol(x / 365)), color: C.price }],
+      marks: [{ x: startDays, label: `${d.period.label} starts` }], xTitle: "Days to delivery",
+      label: "Forward volatility against time to delivery",
+    });
+    chartBox.appendChild(h("p", { class: "note", text: `Two factors (Clewlow–Strickland): a short-term one, the spot's mean reversion, which barely moves a contract far from delivery and moves it hard close in; and a long-term one that moves every contract alike. Spot vol here is ${pct(model.forwardVol(0), 0)}; the month future trades at ${pct(res.futureVol, 0)}.` }));
+  };
+  const later = debounce(draw, 200);
+  const sec = section("opt-month",
+    h("h2", { class: "h2", text: "Average-price option on a delivery month" }),
+    h("p", { class: "note", text: "A month future settles on the average spot price of the month, so an option on that average is an option on the future with two differences: it runs to the end of the month instead of expiring before delivery, and it also carries the uncertainty of the delivery days themselves. Both are priced here on the same model." }),
+    h("div", { class: "filters" }, seg("Option", [{ value: "call", label: "Call" }, { value: "put", label: "Put" }], o0.mKind === "put" ? "put" : "call",
+      (v) => { saveOpt({ mKind: v }); render(); })),
+    h("div", { class: "form-grid even" },
+      optField("Month", "month", later, defaultMonth()), optField("Forward, €/MWh", "mF", later), optField("Strike, €/MWh", "mK", later),
+      optField("Long-term vol, %", "sl", later), optField("Short-term vol, %", "ss", later), optField("Half-life of a spot shock, days", "hl", later),
+      optField("Correlation", "rho", later)),
+    out, chartBox);
+  draw();
+  return sec;
+}
+
+// --- a spread option: the clean spark spread
+function spreadSection() {
+  const out = h("div", { class: "opt-out", "aria-live": "polite" });
+  const draw = () => {
+    const o = optCfg();
+    const F1 = dec(o.pF), gas = dec(o.pGas), hr = dec(o.hr), eua = dec(o.eua), ef = dec(o.ef), vom = dec(o.vom);
+    const s1 = dec(o.pVol) / 100, s2 = dec(o.gVol) / 100, rho = dec(o.pRho), T = dec(o.pDays) / 365;
+    if (![F1, gas, hr, eua, ef, vom, s1, s2, rho, T].every(isFinite) || F1 <= 0 || gas <= 0 || hr <= 0 || T <= 0 || Math.abs(rho) > 1)
+      return warnOut(out, "Fill in every field: positive prices, heat rate and days, and a correlation between −1 and 1.");
+    const F2 = hr * gas, carbon = ef * eua, K = carbon + vom;
+    if (F2 + K <= 0) return warnOut(out, "Fuel plus costs must be positive for Kirk's approximation.");
+    const css = F1 - F2 - K;
+    const value = opt.kirk(F1, F2, K, T, s1, s2, rho);
+    const mc = opt.spreadMc(F1, F2, K, T, s1, s2, rho, 0, "call", 100000, 5);
+    const rhos = [...new Set([0.5, 0.7, 0.8, 0.9, 0.95, rho])].filter((x) => Math.abs(x) <= 1).sort((a, b) => a - b);
+    out.replaceChildren(
+      h("p", { class: "lede", text: `Fuel ${p2(F2)} + carbon ${p2(carbon)} + variable cost ${p2(vom)} = ${p2(F2 + K)} €/MWh against power at ${p2(F1)}: a clean spark spread of ${signed(css)} (efficiency ${pct(1 / hr)}).` }),
+      table(["", "€/MWh"], [
+        h("tr", null, h("th", { scope: "row", text: "Spread option (Kirk)" }), num(p3(value))),
+        h("tr", null, h("th", { scope: "row" }, "Monte Carlo check", h("span", { class: "zn", text: "100,000 paths" })), num(`${p3(mc.price)} ± ${p3(mc.stderr)}`)),
+        h("tr", null, h("th", { scope: "row", text: "Intrinsic value" }), num(p2(Math.max(css, 0)))),
+        h("tr", null, h("th", { scope: "row", text: "Time value" }), num(p2(value - Math.max(css, 0)))),
+      ], { cls: "opt-tbl", caption: "Clean spark spread option" }),
+      h("h3", { class: "h3", text: "The same option at other correlations" }),
+      table(["Correlation", "Spread vol", "Option value"], rhos.map((x) => h("tr", { class: Math.abs(x - rho) < 1e-12 ? "current" : null },
+        h("th", { scope: "row", text: x.toFixed(2) }), num(pct(opt.kirkVol(F2, K, s1, s2, x), 0)), num(p2(opt.kirk(F1, F2, K, T, s1, s2, x))))),
+        { caption: "Spread option value by correlation" }),
+      h("p", { class: "note", text: "The more power and gas move together, the less the spread moves, and the less the option is worth. A plant is a strip of these, one for every hour it could run; tolling deals start from that and subtract what a real plant can't do (start-up costs, minimum run times, ramping)." }));
+  };
+  const later = debounce(draw, 150);
+  const sec = section("opt-spread",
+    h("h2", { class: "h2", text: "Spread option: a gas plant's margin" }),
+    h("p", { class: "note", text: "A gas plant earns power minus fuel minus carbon whenever that's positive, so owning one is like owning calls on the clean spark spread. Kirk's approximation prices one as an option on two futures." }),
+    h("div", { class: "form-grid even" },
+      optField("Power, €/MWh", "pF", later), optField("Gas, €/MWh (thermal)", "pGas", later), optField("Heat rate, MWh gas per MWh", "hr", later),
+      optField("EUA, €/t", "eua", later), optField("Emissions, t per MWh", "ef", later), optField("Variable cost, €/MWh", "vom", later),
+      optField("Power vol, %", "pVol", later), optField("Gas vol, %", "gVol", later), optField("Correlation", "pRho", later), optField("Days to expiry", "pDays", later)),
+    out);
+  draw();
+  return sec;
 }
 
 // ------------------------------------------------------------------ sheets

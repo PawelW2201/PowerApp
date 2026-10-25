@@ -9,6 +9,10 @@ how European power markets work on public data.
 - **Products** works on its own, without a token: delivery hours for any standard product (Cal27, Q1-27, Nov26,
   Wk45, WE, BOM, DA…), base, peak and off-peak, clock changes included, and what a price move is worth on a
   position. Polish products follow TGE's PEAK5 (07–22 on working days); the rest follow EEX (Mon–Fri 08–20).
+- **Options** works on its own too: options on a future (Black-76 or Bachelier, greeks, implied vol, value against
+  the future), an average-price option on a delivery month priced both as a European on the month future and
+  as an Asian on the daily fixings (moment matching and Monte Carlo, on a two-factor forward model), and a
+  clean spark spread option (Kirk, with a Monte Carlo check).
 
 This repository holds **only the app's code**. It contains no data: when you open Today, the app reads
 `summary.json` from the `dashboard-data` branch of your private PowerDesk repository, straight from GitHub's API,
@@ -36,13 +40,14 @@ To install it: in Chrome or Edge use *Install app*; on Android use *Add to Home 
 | File | What it is |
 |---|---|
 | `index.html` | Page shell and styles |
-| `app.js` | The app: connecting, Today, zone sheets, Products, settings |
+| `app.js` | The app: connecting, Today, zone sheets, Products, Options, settings |
 | `calendar.js` | Delivery hours of standard products; a port of PowerDesk's `powerdesk/products.py` |
-| `charts.js` | Small SVG charts: step lines for prices and load, a scatter for price against residual load |
+| `options.js` | Option pricing; a port of PowerDesk's `powerdesk/options.py` |
+| `charts.js` | Small SVG charts: step lines for prices and load, a scatter for price against residual load, lines for option values |
 | `sw.js` | Offline copy of the app's own files (never touches GitHub data requests) |
 | `manifest.webmanifest`, `icons/` | Install metadata and icons |
 | `fonts/` | Barlow and Barlow Semi Condensed, SIL Open Font License 1.1 (`fonts/OFL-Barlow.txt`) |
 | `vendor/qrcode.mjs` | QR Code Generator for JavaScript by Kazuhiko Arase, MIT license (header in the file) |
-| `tests/` | Checks `calendar.js` against 1,050 cases made from the Python reference (`node --test tests/calendar.test.mjs`) |
+| `tests/` | Checks `calendar.js` (1,050 cases) and `options.js` (631 cases) against fixtures made from the Python reference: `npm test` |
 
 No build step: GitHub Pages serves these files as they are.

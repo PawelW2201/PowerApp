@@ -347,6 +347,121 @@ export function scatterChart(container, opts) {
   return { root, destroy() { ro.disconnect(); root.remove(); } };
 }
 
+/**
+ * lineChart(container, opts): series over a numeric x, e.g. an option's value against the future.
+ *  opts.x        ascending x values
+ *  opts.series   [{ name, values, color }] aligned to x
+ *  opts.xFmt     x formatter (ticks and readout); opts.fmt / opts.tickFmt for y
+ *  opts.marks    [{ x, label }] vertical reference lines (the strike, today's price); the readout
+ *                rests on the first one until someone points at the chart
+ *  opts.xTitle, opts.height, opts.label, opts.zero
+ */
+export function lineChart(container, opts) {
+  const xs = opts.x, n = xs.length, series = opts.series;
+  const xFmt = opts.xFmt || String, fmt = opts.fmt || String, tickFmt = opts.tickFmt || fmt;
+  const H = opts.height || 180, AXIS = opts.xTitle ? 34 : 22;
+  const root = el("div", "chart"), head = el("div", "chart-readout"), plotWrap = el("div", "chart-plot");
+  root.append(head, plotWrap);
+  container.appendChild(root);
+  let W = 0, geo = null, s = null, cur = null;
+  const nearest = (x) => { let b = 0; for (let i = 1; i < n; i++) if (Math.abs(xs[i] - x) < Math.abs(xs[b] - x)) b = i; return b; };
+  const rest = opts.marks && opts.marks.length ? nearest(opts.marks[0].x) : n - 1;
+
+  function readout(i) {
+    head.replaceChildren();
+    const left = el("div", "ro-vals");
+    for (const se of series) left.appendChild(keyed(se.name, se.color, se.values[i] == null ? "—" : fmt(se.values[i])));
+    head.append(left, el("span", "ro-date", `${opts.xName ? opts.xName + " " : ""}${xFmt(xs[i])}`));
+  }
+  function render() {
+    W = Math.max(240, Math.round(plotWrap.clientWidth || container.clientWidth || 320));
+    plotWrap.replaceChildren();
+    const m = { l: 6, r: 46, t: 14, b: AXIS };
+    const pw = W - m.l - m.r, ph = H;
+    const { y0, y1, ticks } = domain(series.flatMap((se) => se.values), { zero: opts.zero });
+    const X = (v) => m.l + ((v - xs[0]) / (xs[n - 1] - xs[0])) * pw;
+    const Y = (v) => m.t + ph - ((v - y0) / (y1 - y0)) * ph;
+    geo = { X, Y };
+    const root2 = svg("svg", { width: W, height: ph + m.t + m.b, viewBox: `0 0 ${W} ${ph + m.t + m.b}`,
+      class: "chart-svg", role: "img", tabindex: 0, "aria-label": opts.label || series.map((x) => x.name).join(", ") });
+    const g = svg("g", { class: "grid" }, root2);
+    for (const v of ticks) {
+      if (v < y0 || v > y1) continue;
+      const yy = Math.round(Y(v)) + 0.5;
+      svg("line", { x1: m.l, x2: m.l + pw, y1: yy, y2: yy, class: v === 0 ? "zero" : null }, g);
+      svg("text", { x: m.l + pw + 8, y: yy, class: "tick", "dominant-baseline": "middle" }, g).textContent = tickFmt(v);
+    }
+    svg("line", { x1: m.l, x2: m.l + pw, y1: m.t + ph + 0.5, y2: m.t + ph + 0.5, class: "base" }, root2);
+    const xt = niceTicks(xs[0], xs[n - 1], Math.max(2, Math.floor(pw / 70)));
+    for (const v of xt) {
+      if (v < xs[0] || v > xs[n - 1]) continue;
+      const xx = X(v);
+      svg("line", { x1: xx, x2: xx, y1: m.t + ph, y2: m.t + ph + 4, class: "base" }, root2);
+      svg("text", { x: xx, y: m.t + ph + 16, class: "tick", "text-anchor": "middle" }, root2).textContent = xFmt(v);
+    }
+    if (opts.xTitle) svg("text", { x: m.l + pw, y: m.t + ph + 31, class: "tick", "text-anchor": "end" }, root2).textContent = opts.xTitle;
+    // Reference lines; when two sit close, their labels face away from each other.
+    const marks = (opts.marks || []).filter((mk) => mk.x >= xs[0] && mk.x <= xs[n - 1]).sort((a, b) => a.x - b.x);
+    marks.forEach((mk, i) => {
+      const xx = Math.round(X(mk.x)) + 0.5;
+      const crowded = i + 1 < marks.length && X(marks[i + 1].x) - X(mk.x) < 56;
+      svg("line", { x1: xx, x2: xx, y1: m.t, y2: m.t + ph, class: "mark" }, root2);
+      svg("text", { x: crowded ? xx - 4 : xx + 4, y: m.t + 2, class: "tick", "dominant-baseline": "hanging", "text-anchor": crowded ? "end" : "start" }, root2).textContent = mk.label;
+    });
+    for (const se of series) {
+      let d = "", pen = false;
+      for (let i = 0; i < n; i++) {
+        const v = se.values[i];
+        if (v == null || !isFinite(v)) { pen = false; continue; }
+        d += `${pen ? "L" : "M"}${X(xs[i]).toFixed(1)},${Y(v).toFixed(1)}`;
+        pen = true;
+      }
+      if (d) svg("path", { d, class: "line", style: `--c:${se.color}` }, root2);
+    }
+    const cross = svg("g", { class: "cross" }, root2);
+    const vline = svg("line", { y1: m.t, y2: m.t + ph, class: "vline" }, cross);
+    const dots = series.map((se) => svg("circle", { r: 4, class: "dot", style: `--c:${se.color}` }, cross));
+    const hit = svg("rect", { x: m.l, y: 0, width: pw, height: ph + m.t + m.b, class: "hit" }, root2);
+    s = { cross, vline, dots };
+    const at = (e) => { const r = root2.getBoundingClientRect(); return nearest(xs[0] + ((e.clientX - r.left - m.l) / pw) * (xs[n - 1] - xs[0])); };
+    hit.addEventListener("pointerdown", (e) => { e.preventDefault(); set(at(e)); });
+    hit.addEventListener("pointermove", (e) => { if (e.pointerType === "mouse" || e.buttons) set(at(e)); });
+    hit.addEventListener("pointerleave", (e) => { if (e.pointerType === "mouse") set(null); });
+    root2.addEventListener("keydown", (e) => {
+      const i = cur ?? rest;
+      const k = { ArrowLeft: i - 1, ArrowRight: i + 1, Home: 0, End: n - 1 }[e.key];
+      if (k != null) { e.preventDefault(); set(Math.max(0, Math.min(n - 1, k))); }
+      if (e.key === "Escape") set(null);
+    });
+    root2.addEventListener("blur", () => set(null));
+    plotWrap.appendChild(root2);
+    paint();
+  }
+  function paint() {
+    readout(cur ?? rest);
+    if (!s || !geo) return;
+    if (cur == null) { s.cross.style.display = "none"; return; }
+    s.cross.style.display = "";
+    const x = geo.X(xs[cur]);
+    s.vline.setAttribute("x1", x); s.vline.setAttribute("x2", x);
+    series.forEach((se, k) => {
+      const v = se.values[cur];
+      if (v == null || !isFinite(v)) { s.dots[k].style.display = "none"; return; }
+      s.dots[k].style.display = "";
+      s.dots[k].setAttribute("cx", x); s.dots[k].setAttribute("cy", geo.Y(v));
+    });
+  }
+  function set(i) { cur = i; paint(); }
+  let raf = 0;
+  const ro = new ResizeObserver(() => {
+    cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(() => { const w = Math.round(plotWrap.clientWidth); if (w && Math.abs(w - W) > 1) render(); });
+  });
+  ro.observe(plotWrap);
+  render();
+  return { root, destroy() { ro.disconnect(); root.remove(); } };
+}
+
 // A legend row: keyed names, always visible under a chart with two or more series.
 export function legend(items) {
   const row = el("div", "legend");
