@@ -4,13 +4,14 @@ import { stepChart, scatterChart, lineChart, crosshairGroup, legend, fmtClock } 
 import * as opt from "./options.js";
 import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, weekday, baseHours, isHoliday, zonedToUtc, MONTH_ABBR } from "./calendar.js";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const STORE = "powerapp.v1";
 const DATA_CACHE = "pa-data-v1";
 const DEFAULT_BRANCH = "dashboard-data";
 const RAW = "application/vnd.github.raw+json";
 const TABS = ["today", "products", "options"];
 const TZ = "Europe/Berlin";
+const DESK_TZ = "Europe/Zurich";   // whose "today" the brief is about
 const C = { price: "var(--s-1)", residual: "var(--s-2)", renew: "var(--s-3)", load: "var(--s-load)", hist: "var(--s-hist)", sel: "var(--ink)" };
 const WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
@@ -103,12 +104,11 @@ async function gh(path, accept = "application/vnd.github+json", token = cfg.toke
 }
 const contentsPath = (file, c = cfg) => `/repos/${c.repo}/contents/${file}?ref=${encodeURIComponent(c.branch || DEFAULT_BRANCH)}`;
 const isPowerSummary = (s) => !!s && (s.schema === 1 || s.schema === 2) && Array.isArray(s.zones) && Array.isArray(s.days);
-// Schema 2 keeps residual load per zone; until every view reads it, Germany's also sits where schema 1 had it.
+// A brief cached before schema 2 kept Germany's residual load apart; give it to the DE zone.
 function adapt(s) {
-  if (s.schema !== 2 || s.de) return s;
-  const fund = (s.zones.find((z) => z.code === "DE") || {}).fund;
-  s.de = fund ? { name: "Germany-Luxembourg", scatter: fund.scatter, actual: fund.rows || [], forecast: fund.rows || [], error: fund.error }
-    : { error: "no fundamentals in this brief" };
+  if (s.schema !== 1 || !s.de) return s;
+  const de = s.zones.find((z) => z.code === "DE");
+  if (de && !de.fund) de.fund = { source: "Energy-Charts", basis: "mixed", rows: [...(s.de.actual || []), ...(s.de.forecast || [])], scatter: s.de.scatter, error: s.de.error };
   return s;
 }
 
@@ -230,7 +230,7 @@ function topbar() {
     h("div", { class: "topbar-brand" }, brand()),
     h("div", { class: "topbar-meta" },
       s ? h("span", { class: "asof" }, `Brief for ${dayName(s.today, true)}`) : null,
-      s ? h("span", { class: "updated", title: s.generated_utc }, `built ${ago(s.generated_utc)}`) : null),
+      s ? h("span", { class: "updated", title: s.generated_utc }, `updated ${ago(s.generated_utc)}`) : null),
     h("div", { class: "topbar-actions" },
       connected() ? h("button", { class: "icon-btn", type: "button", "aria-label": "Refresh", title: "Refresh", id: "refresh-btn", onclick: () => load({ force: true }) },
         navIcon("M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7")) : null,
@@ -249,6 +249,10 @@ function renderStatus() {
   if (!e) {
     if (state.summary && state.source === "cache" && !state.loading)
       el.appendChild(h("p", { class: "banner" }, `Showing the saved brief for ${dayName(state.summary.today, true)}.`));
+    else if (state.summary && !state.loading) {
+      const late = lateWindow(state.summary);
+      if (late) el.appendChild(h("p", { class: "banner" }, `The ${late} update hasn't arrived yet (last one ${ago(state.summary.generated_utc)}). GitHub sometimes delays or skips scheduled runs; the next one in the window catches up.`));
+    }
     return;
   }
   let msg, action = null;
@@ -283,14 +287,34 @@ const num = (text, cls = "") => h("td", { class: `num ${cls}`.trim(), text });
 
 // ------------------------------------------------------------------ Today
 function zoneStats(z, day) { return z && z.days ? z.days[day] || null : null; }
+// Days are named from the phone's date in Zurich, the desk's time zone, so an old brief still reads right.
+const deskToday = () => todayIn(DESK_TZ);
+function dayWord(day) {
+  const t = deskToday(), n = parseIso(day);
+  return n === t ? "Today" : n === t - 1 ? "Yesterday" : n === t + 1 ? "Tomorrow" : dayName(day);
+}
 function pickDay(s) {
   const has = (d) => s.zones.some((z) => zoneStats(z, d));
-  const [, today, tomorrow] = s.days;
+  const t = deskToday(), tomorrow = isoDate(t + 1), today = isoDate(t);
   let day = ui("day", null);
-  if (!s.days.includes(day) || !has(day)) day = has(tomorrow) ? tomorrow : today;
+  if (!s.days.includes(day) || !has(day)) {
+    day = [tomorrow, today].find((d) => s.days.includes(d) && has(d)) || [...s.days].reverse().find(has) || s.days[1];
+  }
   return { day, has };
 }
-function dayWord(s, day) { return ["Yesterday", "Today", "Tomorrow"][s.days.indexOf(day)] || day; }
+
+// The brief runs in three windows (Zurich time). It's late if a window opened over two hours ago
+// and nothing has arrived since.
+const WINDOWS = [[7, 17, "morning"], [13, 17, "afternoon"], [18, 17, "evening"]];
+function lateWindow(s) {
+  const now = Date.now(), t = deskToday();
+  let latest = null;
+  for (const n of [t - 1, t]) for (const [hh, mm, name] of WINDOWS) {
+    const at = zonedToUtc(n, hh, DESK_TZ) + mm * 60000;
+    if (at + 2 * 3600000 <= now) latest = { at, name };
+  }
+  return latest && Date.parse(s.generated_utc) < latest.at ? latest.name : null;
+}
 
 function viewToday() {
   if (!connected()) return connectCard();
@@ -299,20 +323,20 @@ function viewToday() {
   const { day, has } = pickDay(s);
   const de = s.zones.find((z) => z.code === "DE");
   const st = zoneStats(de, day);
-  const idx = s.days.indexOf(day);
-  const prevDay = idx > 0 ? s.days[idx - 1] : null;
-  const prev = prevDay ? zoneStats(de, prevDay) : null;
+  const prevDay = isoDate(parseIso(day) - 1);
+  const prev = zoneStats(de, prevDay);
 
-  const daySeg = seg("Delivery day", s.days.map((d, i) => ({
-    value: d, label: ["Yesterday", "Today", "Tomorrow"][i], disabled: !has(d),
+  const daySeg = seg("Delivery day", s.days.map((d) => ({
+    value: d, label: dayWord(d), disabled: !has(d),
     title: has(d) ? dayName(d, true) : "Not published yet: tomorrow's prices come out after the noon auction",
   })), day, (d) => { setUi("day", d); render(); });
 
+  const tomorrowIn = s.days.includes(isoDate(deskToday() + 1)) && has(isoDate(deskToday() + 1));
   const head = section("brief-head",
     kicker("Day-ahead auction · €/MWh"),
-    h("h1", { class: "headline", text: `${dayWord(s, day)}, ${dayName(day, true)}` }),
+    h("h1", { class: "headline", text: `${dayWord(day)}, ${dayName(day, true)}` }),
     h("div", { class: "filters" }, daySeg),
-    has(s.days[2]) ? null : h("p", { class: "note", text: "Tomorrow appears after the noon auction is published; the brief runs at 08:23, 13:41 and 18:47." }));
+    tomorrowIn ? null : h("p", { class: "note", text: "Tomorrow's prices come out after the noon auction; the brief checks for them several times between 13:17 and 14:47." }));
 
   let hero;
   if (st) {
@@ -353,91 +377,135 @@ function zonesBand(s, day) {
   return section("zones",
     h("h2", { class: "h2", text: "Across Europe" }),
     table(head, rows, { cls: "zones-tbl", caption: "Day-ahead prices by bidding zone" }),
-    h("p", { class: "note", text: `Base is the average over every quarter-hour of the day; ${anyPeak ? "peak follows each market's own definition (Poland: 07–22 on working days)" : "there are no peak hours on a weekend"}. vs DE is the base spread to Germany. Tap a zone for its curve.` }));
+    h("p", { class: "note", text: `Base is the average over every quarter-hour of the day; ${anyPeak ? "peak follows each market's own definition (Poland: 07–22 on working days)" : "there are no peak hours on a weekend"}. vs DE is the base spread to Germany. Tap a zone for its curve and its residual load.` }));
 }
 
-// Rows whose hour falls on the given local delivery day.
-const dayRows = (rows, day) => (rows || []).filter((r) => isoDate(todayIn(TZ, r[0] * 1000)) === day);
+// Rows whose hour falls on the given local delivery day (in the zone's time zone).
+const dayRows = (rows, day, tz) => (rows || []).filter((r) => isoDate(todayIn(tz, r[0] * 1000)) === day);
+const zoneTz = (z) => z.tz || TZ;
 
 function residualBand(s, day) {
-  const de = s.de || {};
-  const sec = section("residual", kicker("Germany-Luxembourg"), h("h2", { class: "h2", text: "Residual load and price" }));
-  if (de.error) { sec.appendChild(h("p", { class: "empty", text: `No fundamentals in this brief (${de.error}).` })); return sec; }
-  const isYesterday = s.days.indexOf(day) === 0;
-  const rows = dayRows(isYesterday ? de.actual : de.forecast, day);
-  const priceZone = s.zones.find((z) => z.code === "DE");
-  const pt = [], pv = [];
-  if (priceZone && priceZone.series) priceZone.series.t.forEach((t, i) => { if (isoDate(todayIn(TZ, t * 1000)) === day) { pt.push(t); pv.push(priceZone.series.v[i]); } });
-  sec.appendChild(h("p", { class: "lede", text: isYesterday
-    ? "Residual load is what's left of demand after wind and solar: load minus wind minus solar. Yesterday's numbers are actuals."
-    : "Residual load is what's left of demand after wind and solar: load minus wind minus solar. These are the TSOs' day-ahead forecasts, which is what the auction priced." }));
-
-  const box = h("div", { class: "chart-box" });
-  sec.appendChild(box);
-  const group = crosshairGroup();
-  if (pt.length) {
-    box.appendChild(h("h3", { class: "h3", text: "Price, €/MWh" }));
-    stepChart(box, { t: pt, step: (pt[1] - pt[0]) || 900, series: [{ name: "Price", values: pv, color: C.price }], tz: TZ, fmt: p2, tickFmt: tick, height: 140, group, label: `German day-ahead price, ${dayName(day, true)}` });
-  }
-  if (rows.length) {
-    box.appendChild(h("h3", { class: "h3", text: `Load, wind + solar and residual load, GW${isYesterday ? "" : " (forecast)"}` }));
-    const t = rows.map((r) => r[0]);
-    stepChart(box, { t, step: 3600, tz: TZ, fmt: gw, tickFmt: tick, height: 140, group, label: "Load, wind plus solar and residual load in gigawatts",
-      series: [
-        { name: "Load", values: rows.map((r) => r[1]), color: C.load },
-        { name: "Wind + solar", values: rows.map((r) => +(r[2] + r[3]).toFixed(2)), color: C.renew },
-        { name: "Residual", values: rows.map((r) => r[4]), color: C.residual },
-      ] });
-    box.appendChild(legend([{ name: "Load", color: C.load }, { name: "Wind + solar", color: C.renew }, { name: "Residual load", color: C.residual }]));
-    sec.appendChild(h("details", { class: "raw" }, h("summary", { text: "Show the hours as a table" }),
-      table(["Hour", "Price", "Load", "Wind", "Solar", "Residual"], rows.map((r) => h("tr", null,
-        h("th", { scope: "row", text: fmtClock(r[0], TZ) }), num(p2(r[5])), num(gw(r[1])), num(gw(r[3])), num(gw(r[2])), num(gw(r[4])))))));
-  } else if (!isYesterday) {
-    sec.appendChild(h("p", { class: "note", text: "The day-ahead forecast for this day isn't in the brief yet; TSOs publish it by 18:00 the day before." }));
-  }
-
-  // The supply curve, revealed: 14 days of hours, with the chosen day on top.
-  const hist = (de.scatter && de.scatter.points) || [];
-  if (hist.length) {
-    const selPts = rows.filter((r) => r[5] != null).map((r) => ({ x: r[4], y: r[5], label: `${dayName(day)} ${fmtClock(r[0], TZ)}` }));
-    sec.appendChild(h("h3", { class: "h3 sp", text: "Price against residual load" }));
-    sec.appendChild(h("p", { class: "note", text: `Each dot is one hour of the last ${de.scatter.days} days. The cloud traces the merit order: low residual load means cheap plants set the price, high residual load reaches the expensive ones.` }));
-    const sbox = h("div", { class: "chart-box" });
-    sec.appendChild(sbox);
-    scatterChart(sbox, {
-      groups: [
-        { name: `Last ${de.scatter.days} days`, color: C.hist, cls: "hist", points: hist.map(([x, y, hr]) => ({ x, y, label: `${String(hr).padStart(2, "0")}:00` })) },
-        ...(selPts.length ? [{ name: dayName(day, true), color: C.sel, cls: "sel", r: 4.5, points: selPts }] : []),
-      ],
-      xFmt: tick, yFmt: tick, xTitle: "Residual load, GW", yTitle: "€/MWh", height: 260,
-      xName: "Residual", yName: "Price", xRead: (v) => `${gw(v)} GW`, yRead: p2,
-      label: "Scatter of hourly German day-ahead price against residual load",
-    });
-    sbox.appendChild(legend([{ name: `Last ${de.scatter.days} days, hourly`, color: C.hist, dot: true },
-      ...(selPts.length ? [{ name: `${dayName(day, true)}${isYesterday ? "" : " (forecast load)"}`, color: C.sel, dot: true }] : [])]));
-    sec.appendChild(supplyTable(hist));
-  }
+  const withFund = s.zones.filter((z) => z.fund);
+  const sec = section("residual", kicker("What the auction priced"), h("h2", { class: "h2", text: "Residual load and price" }));
+  if (!withFund.length) { sec.appendChild(h("p", { class: "empty", text: "No load, wind or solar forecasts in this brief." })); return sec; }
+  let code = ui("resZone", "DE");
+  if (!withFund.some((z) => z.code === code)) code = withFund[0].code;
+  const z = withFund.find((x) => x.code === code);
+  sec.appendChild(h("div", { class: "filters" },
+    h("label", { class: "inline-field" }, h("span", { text: "Zone" }),
+      h("select", { class: "select", "aria-label": "Zone", onchange: (e) => { setUi("resZone", e.target.value, true); render(); } },
+        withFund.map((x) => h("option", { value: x.code, selected: x.code === code || null }, `${x.code} · ${x.name}`))))));
+  sec.appendChild(residualBlock(s, z, day));
   return sec;
 }
 
-// The scatter's table twin: the curve in residual-load bands.
+function missingNote(z) {
+  const f = z.fund, miss = (f.missing || []).map((p) => (p === "wind_onshore" ? "wind" : p));
+  if (!miss.length) return null;
+  const what = miss.length === 2 ? "wind or solar forecast" : `${miss[0]} forecast`;
+  const rest = miss.length === 2 ? "residual load here is simply load" : `residual load here is load minus ${miss[0] === "wind" ? "solar" : "wind"}`;
+  return h("p", { class: "note", text: `${z.name} publishes no ${what} on ENTSO-E, so ${rest}.` });
+}
+
+// Price, the fundamentals behind it, and the zone's recent supply curve, for one day.
+function residualBlock(s, z, day, { scatterHeight = 260, deferCharts = false } = {}) {
+  const f = z.fund, tz = zoneTz(z), wrap = h("div", { class: "res-block" });
+  if (f.error && !(f.rows || []).length) { wrap.appendChild(h("p", { class: "empty", text: `No fundamentals for ${z.name} (${f.error}).` })); return wrap; }
+  const isPast = parseIso(day) < deskToday();
+  const rows = dayRows(f.rows, day, tz);
+  const pt = [], pv = [];
+  if (z.series) z.series.t.forEach((t, i) => { if (isoDate(todayIn(tz, t * 1000)) === day) { pt.push(t); pv.push(z.series.v[i]); } });
+  const basis = f.basis === "mixed" && isPast
+    ? "Residual load is load minus wind minus solar. Past days use actual values here; today and tomorrow use day-ahead forecasts."
+    : "Residual load is load minus wind minus solar. These are the TSOs' day-ahead forecasts, the numbers the auction priced.";
+  wrap.append(h("p", { class: "lede", text: basis }));
+  const note = missingNote(z);
+  if (note) wrap.appendChild(note);
+
+  const box = h("div", { class: "chart-box" });
+  wrap.appendChild(box);
+  const draw = () => {
+    const group = crosshairGroup();
+    if (pt.length) {
+      box.appendChild(h("h3", { class: "h3", text: "Price, €/MWh" }));
+      stepChart(box, { t: pt, step: (z.step_min || 15) * 60, series: [{ name: "Price", values: pv, color: C.price }], tz, fmt: p2, tickFmt: tick, height: 130, group, label: `${z.name} day-ahead price, ${dayName(day, true)}` });
+    }
+    if (rows.length) {
+      box.appendChild(h("h3", { class: "h3", text: "Load, wind + solar and residual load, GW" }));
+      const renew = (r) => (r[2] == null && r[3] == null ? null : +((r[2] || 0) + (r[3] || 0)).toFixed(2));
+      stepChart(box, { t: rows.map((r) => r[0]), step: 3600, tz, fmt: gw, tickFmt: tick, height: 130, group, label: "Load, wind plus solar and residual load in gigawatts",
+        series: [
+          { name: "Load", values: rows.map((r) => r[1]), color: C.load },
+          { name: "Wind + solar", values: rows.map(renew), color: C.renew },
+          { name: "Residual", values: rows.map((r) => r[4]), color: C.residual },
+        ] });
+      box.appendChild(legend([{ name: "Load", color: C.load }, { name: "Wind + solar", color: C.renew }, { name: "Residual load", color: C.residual }]));
+    }
+  };
+  if (deferCharts) requestAnimationFrame(draw); else draw();
+  if (rows.length) {
+    wrap.appendChild(h("details", { class: "raw" }, h("summary", { text: "Show the hours as a table" }),
+      table(["Hour", "Price", "Load", "Wind", "Solar", "Residual"], rows.map((r) => h("tr", null,
+        h("th", { scope: "row", text: fmtClock(r[0], tz) }), num(p2(r[5])), num(gw(r[1])), num(gw(r[3])), num(gw(r[2])), num(gw(r[4])))))));
+  } else {
+    wrap.appendChild(h("p", { class: "note", text: isPast ? "No forecasts for this day in the brief." : "The day-ahead forecast for this day isn't in yet; TSOs publish wind and solar by 18:00 the day before." }));
+  }
+
+  // The supply curve, revealed: the last two weeks of hours, with the chosen day on top.
+  const hist = (f.scatter && f.scatter.points) || [];
+  if (hist.length) {
+    const selPts = rows.filter((r) => r[5] != null).map((r) => ({ x: r[4], y: r[5], label: `${dayName(day)} ${fmtClock(r[0], tz)}` }));
+    wrap.appendChild(h("h3", { class: "h3 sp", text: "Price against residual load" }));
+    wrap.appendChild(h("p", { class: "note", text: `Each dot is one hour of the last ${f.scatter.days} days. The cloud traces the merit order: low residual load means cheap plants set the price, high residual load reaches the expensive ones. A zone whose cloud is flat imports its price from its neighbours.` }));
+    const sbox = h("div", { class: "chart-box" });
+    wrap.appendChild(sbox);
+    const drawScatter = () => {
+      scatterChart(sbox, {
+        groups: [
+          { name: `Last ${f.scatter.days} days`, color: C.hist, cls: "hist", points: hist.map(([x, y, hr]) => ({ x, y, label: `${String(hr).padStart(2, "0")}:00` })) },
+          ...(selPts.length ? [{ name: dayName(day, true), color: C.sel, cls: "sel", r: 4.5, points: selPts }] : []),
+        ],
+        xFmt: tick, yFmt: tick, xTitle: "Residual load, GW", yTitle: "€/MWh", height: scatterHeight,
+        xName: "Residual", yName: "Price", xRead: (v) => `${gw(v)} GW`, yRead: p2,
+        label: `Scatter of hourly ${z.name} day-ahead price against residual load`,
+      });
+      sbox.appendChild(legend([{ name: `Last ${f.scatter.days} days, hourly`, color: C.hist, dot: true },
+        ...(selPts.length ? [{ name: dayName(day, true), color: C.sel, dot: true }] : [])]));
+    };
+    if (deferCharts) requestAnimationFrame(drawScatter); else drawScatter();
+    wrap.appendChild(supplyTable(hist));
+  }
+  return wrap;
+}
+
+// The scatter's table twin: the curve in five bands of residual load, an equal number of hours in each.
 function supplyTable(points) {
-  const bands = [[-Infinity, 0, "Below 0 GW"], [0, 15, "0–15 GW"], [15, 30, "15–30 GW"], [30, 45, "30–45 GW"], [45, Infinity, "45 GW and up"]];
-  const rows = bands.map(([lo, hi, name]) => {
+  const xs = points.map(([x]) => x).sort((a, b) => a - b);
+  const edges = [0, 0.2, 0.4, 0.6, 0.8].map((q) => xs[Math.floor(q * xs.length)]).concat(Infinity);
+  const nd = xs[xs.length - 1] - xs[0] < 5 ? 1 : 0;
+  const f = (v) => neg(new Intl.NumberFormat("en-US", { minimumFractionDigits: nd, maximumFractionDigits: nd }).format(v), v);
+  const rows = [];
+  for (let i = 0; i < 5; i++) {
+    const lo = edges[i], hi = edges[i + 1];
+    if (i > 0 && lo === edges[i - 1]) continue;
     const inBand = points.filter(([x]) => x >= lo && x < hi);
-    if (!inBand.length) return null;
+    if (!inBand.length) continue;
     const prices = inBand.map(([, y]) => y).sort((a, b) => a - b);
     const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
-    const med = prices[Math.floor(prices.length / 2)];
-    return h("tr", null, h("th", { scope: "row", text: name }), num(int(inBand.length)), num(p1(avg)), num(p1(med)), num(p1(prices[0])), num(p1(prices[prices.length - 1])));
-  }).filter(Boolean);
+    const top = Math.max(...inBand.map(([x]) => x));
+    rows.push(h("tr", null, h("th", { scope: "row", text: `${f(lo)} to ${f(top)} GW` }), num(int(inBand.length)), num(p1(avg)),
+      num(p1(prices[Math.floor(prices.length / 2)])), num(p1(prices[0])), num(p1(prices[prices.length - 1]))));
+  }
   return h("details", { class: "raw" }, h("summary", { text: "Show the curve in numbers" }),
     table(["Residual load", "Hours", "Average", "Median", "Low", "High"], rows, { caption: "Price by residual load band" }));
 }
 
 function sourceNote(s) {
+  const st = s.status || {};
+  const bad = st.entsoe && !["ok", "no token"].includes(st.entsoe);
   return h("div", { class: "pipeline" },
-    h("p", null, `Source: ${s.source}. Prices for some zones are licensed for private, non-commercial use only. Brief built ${ago(s.generated_utc)}.`));
+    bad ? h("p", { class: "warn-text", text: `ENTSO-E: ${st.entsoe}. Prices fall back to Energy-Charts where needed.` }) : null,
+    h("p", null, `Sources: ${s.source}. Power exchanges' prices can come with stricter terms than the TSOs' data, and some zones' are for private use only. Brief updated ${ago(s.generated_utc)}.`));
 }
 
 // ------------------------------------------------------------------ zone sheet
@@ -451,7 +519,7 @@ function viewZone(code) {
   if (z.error) { wrap.appendChild(h("p", { class: "empty", text: `The brief couldn't get this zone: ${z.error}.` })); return wrap; }
   const box = h("div", { class: "chart-box" });
   wrap.appendChild(box);
-  requestAnimationFrame(() => stepChart(box, { t: z.series.t, step: z.step_min * 60, series: [{ name: "Price", values: z.series.v, color: C.price }], tz: TZ, fmt: p2, tickFmt: tick, height: 170,
+  requestAnimationFrame(() => stepChart(box, { t: z.series.t, step: z.step_min * 60, series: [{ name: "Price", values: z.series.v, color: C.price }], tz: zoneTz(z), fmt: p2, tickFmt: tick, height: 170,
     label: `${z.name} day-ahead price, yesterday to tomorrow` }));
   // Metrics down, published days across: fits a phone.
   const days = s.days.filter((d) => zoneStats(z, d));
@@ -468,9 +536,21 @@ function viewZone(code) {
     metric("Negative hours", (st) => upTo2.format(st.negative_hours)),
     metric("Hours in", (st) => `${upTo2.format(st.hours)} of ${st.day_hours}`),
   ];
-  wrap.appendChild(table(["", ...days.map((d) => dayName(d))], rows, { cls: "zone-stats", caption: `${z.name} daily statistics` }));
+  wrap.appendChild(table(["", ...days.map((d) => `${dayWord(d)}`)], rows, { cls: "zone-stats", caption: `${z.name} daily statistics` }));
   if (days.length < s.days.length) wrap.appendChild(h("p", { class: "note", text: "Tomorrow's prices aren't in the brief yet." }));
-  if (z.license) wrap.appendChild(h("p", { class: "note", text: `Data licence: ${z.license}` }));
+  const src = z.price_source ? `Prices: ${z.price_source}.` : "";
+  const c = z.check;
+  const chk = !c || !c.hours ? ""
+    : c.max_diff < 0.005 ? ` Energy-Charts matches it exactly over ${c.hours} hours.`
+    : ` Energy-Charts differs in ${c.differing ?? "some"} of ${c.hours} hours, by up to ${p2(c.max_diff)} €/MWh; the brief uses ENTSO-E.`;
+  if (src || chk) wrap.appendChild(h("p", { class: "note", text: src + chk }));
+  if (z.fund) {
+    const { day } = pickDay(s);
+    wrap.appendChild(h("h3", { class: "h3 sp", text: `Residual load and price, ${dayWord(day).toLowerCase()}` }));
+    wrap.appendChild(residualBlock(s, z, day, { scatterHeight: 220, deferCharts: true }));
+  }
+  const lic = z.license || z.license_energy_charts;
+  if (lic) wrap.appendChild(h("p", { class: "note", text: `Energy-Charts licence for this zone: ${lic}` }));
   return wrap;
 }
 

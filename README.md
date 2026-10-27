@@ -3,9 +3,10 @@
 An installable web app for [PowerDesk](https://github.com/PawelW2201/PowerDesk), a personal project for learning
 how European power markets work on public data.
 
-- **Today** shows the day-ahead brief PowerDesk builds three times a day: base, peak and off-peak prices for 13
-  bidding zones, Germany's price curve against its residual load (load minus wind and solar), and where the day
-  sits on the last two weeks' supply curve.
+- **Today** shows the day-ahead brief PowerDesk builds through the day: base, peak and off-peak prices for 13
+  bidding zones, and for any of them the price curve against residual load (load minus wind and solar, from the
+  TSOs' day-ahead forecasts on ENTSO-E) and where the day sits on the last two weeks' supply curve. Tap a zone for
+  its own sheet, with the cross-check between ENTSO-E and Energy-Charts prices.
 - **Products** works on its own, without a token: delivery hours for any standard product (Cal27, Q1-27, Nov26,
   Wk45, WE, BOM, DA…), base, peak and off-peak, clock changes included, and what a price move is worth on a
   position. Polish products follow TGE's PEAK5 (07–22 on working days); the rest follow EEX (Mon–Fri 08–20).
