@@ -102,7 +102,15 @@ async function gh(path, accept = "application/vnd.github+json", token = cfg.toke
   return accept === RAW ? res.text() : res.json();
 }
 const contentsPath = (file, c = cfg) => `/repos/${c.repo}/contents/${file}?ref=${encodeURIComponent(c.branch || DEFAULT_BRANCH)}`;
-const isPowerSummary = (s) => !!s && s.schema === 1 && Array.isArray(s.zones) && Array.isArray(s.days);
+const isPowerSummary = (s) => !!s && (s.schema === 1 || s.schema === 2) && Array.isArray(s.zones) && Array.isArray(s.days);
+// Schema 2 keeps residual load per zone; until every view reads it, Germany's also sits where schema 1 had it.
+function adapt(s) {
+  if (s.schema !== 2 || s.de) return s;
+  const fund = (s.zones.find((z) => z.code === "DE") || {}).fund;
+  s.de = fund ? { name: "Germany-Luxembourg", scatter: fund.scatter, actual: fund.rows || [], forecast: fund.rows || [], error: fund.error }
+    : { error: "no fundamentals in this brief" };
+  return s;
+}
 
 // ------------------------------------------------------------------ state
 const state = { summary: null, source: null, fetchedAt: null, loading: false, error: null, tab: "today", ui: {} };
@@ -113,7 +121,7 @@ function setUi(k, v, persist) {
 }
 function applySummary(s, source, at) {
   if (!isPowerSummary(s)) throw new Error("Unexpected data format");
-  state.summary = s;
+  state.summary = adapt(s);
   state.source = source;
   state.fetchedAt = at || new Date().toISOString();
 }
