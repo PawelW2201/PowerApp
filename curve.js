@@ -249,15 +249,19 @@ export function build(quotes, marketCode = "DE", stats = null, years = [], mode 
     const f = hs.map(([, , h, d]) => F[mi][d][h]);
     const mb = hist[mi] != null ? hist[mi] : fallback;
     const vals = new Array(hs.length);
+    const shaping = { mb, peak: null, offpeak: null };   // how each block was shaped (the RfQ's scenarios reuse it)
     for (const [isPk, target] of [[true, x[2 * k]], [false, x[2 * k + 1]]]) {
       const idx = []; hs.forEach((row, i) => { if (row[4] === isPk) idx.push(i); });
       if (!idx.length) continue;
       let sf = 0; for (const i of idx) sf += f[i];
       const meanF = sf / idx.length;
       // scaling a block priced at or below zero would turn its shape upside down, so those go additive
-      if (mode === "multiplicative" && meanF > 0.05 && target > 0) for (const i of idx) vals[i] = target * f[i] / meanF;
+      const mult = mode === "multiplicative" && meanF > 0.05 && target > 0;
+      if (mult) for (const i of idx) vals[i] = target * f[i] / meanF;
       else for (const i of idx) vals[i] = target + (f[i] - meanF) * mb;
+      shaping[isPk ? "peak" : "offpeak"] = { price: target, mean_f: meanF, mult };
     }
+    outMonths[k].shaping = shaping;
     hs.forEach((row, i) => { t.push(row[0]); day.push(row[1]); hour.push(row[2]); peak.push(row[4]); price.push(vals[i]); });
   });
   if (!stats) notes.push("No history for this zone yet: months nobody quoted are flat at the quotes' level, and hours are flat within peak and off-peak.");

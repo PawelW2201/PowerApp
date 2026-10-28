@@ -10,15 +10,23 @@ how European power markets work on public data.
 - **Products** works on its own, without a token: delivery hours for any standard product (Cal27, Q1-27, Nov26,
   Wk45, WE, BOM, DA…), base, peak and off-peak, clock changes included, and what a price move is worth on a
   position. Polish products follow TGE's PEAK5 (07–22 on working days); the rest follow EEX (Mon–Fri 08–20).
+- **Curve** builds an hourly price forward curve from the base and peak quotes you type for months, quarters,
+  seasons and years: it checks they fit together, shows the implied products, shapes every hour from the zone's
+  history, and prices profiles against it (solar and wind capture, a battery's intrinsic value, any block of hours).
+  Below, how the shape of a day and capture rates changed from 2019 on.
+- **RfQ** prices a deal against that curve: a pay-as-produced solar or wind PPA as a bridge from the base price to
+  an offer in €/MWh, or a battery toll from intrinsic value to an offer in €/MW a year. Each history year is a
+  scenario, so you also see how much the deal moves from one kind of year to another.
 - **Options** works on its own too: options on a future (Black-76 or Bachelier, greeks, implied vol, value against
   the future), an average-price option on a delivery month priced both as a European on the month future and
   as an Asian on the daily fixings (moment matching and Monte Carlo, on a two-factor forward model), and a
   clean spark spread option (Kirk, with a Monte Carlo check).
 
 This repository holds **only the app's code**. It contains no data: when you open Today, the app reads
-`summary.json` from the `dashboard-data` branch of your private PowerDesk repository, straight from GitHub's API,
-with a read-only token you paste once per device. Some of that data is licensed for private use only, which is
-why it never lives here.
+`summary.json` from the `dashboard-data` branch of your private PowerDesk repository, and Curve and RfQ read the
+history statistics and hourly history from its `data` branch, straight from GitHub's API, with a read-only token
+you paste once per device. Some of that data is licensed for private use only, which is why it never lives here.
+The quotes you type stay on your device.
 
 ## Set up
 
@@ -41,14 +49,16 @@ To install it: in Chrome or Edge use *Install app*; on Android use *Add to Home 
 | File | What it is |
 |---|---|
 | `index.html` | Page shell and styles |
-| `app.js` | The app: connecting, Today, zone sheets, Products, Options, settings |
+| `app.js` | The app: connecting, Today, zone sheets, Products, Curve, RfQ, Options, settings |
 | `calendar.js` | Delivery hours of standard products; a port of PowerDesk's `powerdesk/products.py` |
 | `options.js` | Option pricing; a port of PowerDesk's `powerdesk/options.py` |
-| `charts.js` | Small SVG charts: step lines for prices and load, a scatter for price against residual load, lines for option values |
+| `curve.js` | The forward curve; a port of PowerDesk's `powerdesk/curve.py` |
+| `rfq.js` | PPA and toll pricing against the curve; a port of PowerDesk's `powerdesk/rfq.py` |
+| `charts.js` | Small charts: step lines for prices and load, a scatter for price against residual load, lines for option values and curves, and the bridge (waterfall) behind an offer |
 | `sw.js` | Offline copy of the app's own files (never touches GitHub data requests) |
 | `manifest.webmanifest`, `icons/` | Install metadata and icons |
 | `fonts/` | Barlow and Barlow Semi Condensed, SIL Open Font License 1.1 (`fonts/OFL-Barlow.txt`) |
 | `vendor/qrcode.mjs` | QR Code Generator for JavaScript by Kazuhiko Arase, MIT license (header in the file) |
-| `tests/` | Checks `calendar.js` (1,050 cases) and `options.js` (631 cases) against fixtures made from the Python reference: `npm test` |
+| `tests/` | Checks `calendar.js`, `options.js`, `curve.js` and `rfq.js` against fixtures made from the Python reference, on synthetic data only: `npm test` |
 
 No build step: GitHub Pages serves these files as they are.

@@ -1,16 +1,17 @@
 // app.js — PowerApp. Products works on its own; Today reads PowerDesk's summary.json
 // from the private repo's dashboard-data branch with a read-only token.
-import { stepChart, scatterChart, lineChart, crosshairGroup, legend, fmtClock } from "./charts.js";
+import { stepChart, scatterChart, lineChart, waterfallChart, crosshairGroup, legend, fmtClock } from "./charts.js";
 import * as opt from "./options.js";
 import * as crv from "./curve.js";
-import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, weekday, baseHours, isHoliday, zonedToUtc, parse, MONTH_ABBR } from "./calendar.js";
+import * as rfq from "./rfq.js";
+import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, dayNum, weekday, baseHours, isHoliday, zonedToUtc, parse, MONTH_ABBR } from "./calendar.js";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const STORE = "powerapp.v1";
 const DATA_CACHE = "pa-data-v1";
 const DEFAULT_BRANCH = "dashboard-data";
 const RAW = "application/vnd.github.raw+json";
-const TABS = ["today", "products", "curve", "options"];
+const TABS = ["today", "products", "curve", "rfq", "options"];
 const TZ = "Europe/Berlin";
 const DESK_TZ = "Europe/Zurich";   // whose "today" the brief is about
 const C = { price: "var(--s-1)", residual: "var(--s-2)", renew: "var(--s-3)", load: "var(--s-load)", hist: "var(--s-hist)", sel: "var(--ink)" };
@@ -187,7 +188,7 @@ function render() {
   const main = h("main", { id: "view", tabindex: "-1" });
   app.replaceChildren(rail(), h("div", { class: "main-col" }, topbar(), h("div", { id: "status" }), main), tabbar());
   renderStatus();
-  const view = { today: viewToday, products: viewProducts, curve: viewCurve, options: viewOptions }[state.tab];
+  const view = { today: viewToday, products: viewProducts, curve: viewCurve, rfq: viewRfq, options: viewOptions }[state.tab];
   try { main.appendChild(view()); }
   catch (e) { console.error(e); main.appendChild(h("p", { class: "empty", text: `This view couldn't be drawn: ${e.message}` })); }
   const sy = state.ui[`scroll:${state.tab}`];
@@ -198,11 +199,12 @@ function render() {
 function brand() {
   return h("span", { class: "brand" }, h("img", { src: "icons/icon.svg", alt: "", width: 26, height: 26 }), h("span", { class: "brand-name", text: "PowerApp" }));
 }
-const TAB_LABEL = { today: "Today", products: "Products", curve: "Curve", options: "Options" };
+const TAB_LABEL = { today: "Today", products: "Products", curve: "Curve", rfq: "RfQ", options: "Options" };
 const TAB_ICON = {
   today: "M3 17h3v-4h3v-6h3v9h3v-5h3v3h3",
   products: "M4 5h16v14H4zM4 10h16M9 10v9M14 10v9",
   curve: "M3 17c3 0 4-9 7-9s3 6 6 6 3-8 5-8M3 21h18",
+  rfq: "M3.5 3.5h8l9 9-8 8-9-9zM8 8h.01",
   options: "M3 15h8l9-9M3 20h18",
 };
 function navIcon(d) {
@@ -992,6 +994,267 @@ function curveHistory(stats, zone) {
     box,
     table(["Year", "Base", h("th", { class: "wide", text: "Peak − base" }), "Solar", "Wind", "Battery"], rows, { caption: "Yearly averages" }),
     h("p", { class: "note", text: "Base is the average of the monthly base prices, in €/MWh. Solar and wind are capture rates: the output-weighted price over the base price. Battery is what a 2-hour battery earned, in € per MW per day, cycling once a day with perfect foresight of day-ahead prices at 85% round trip: an upper bound for day-ahead arbitrage alone." }));
+}
+
+// ------------------------------------------------------------------ RfQ
+// Price a deal against the Curve tab's curve: a pay-as-produced solar or wind PPA, or a battery toll.
+const YIELD_SOLAR = { DE: 1000, FR: 1150, NL: 950, BE: 950, AT: 1050, CH: 1050, PL: 1000, CZ: 1050, SK: 1150, HU: 1250, SI: 1150, "IT-N": 1300, ES: 1700 };
+const YIELD_WIND = 2200;
+const RFQ_DEFAULTS = {
+  deal: "solar", start: "", ppaYears: "10", tollYears: "7", growth: "2", discount: "5",
+  ppaMw: "50", yields: {}, pvDeg: "0.5", windDeg: "0", neg: "paid", trend: "0", balSolar: "2", balWind: "3", ppaRisk: "1.5", ppaMargin: "1",
+  bessMw: "50", bh: "2", cycles: "1", rt: "85", avail: "97", bessDeg: "2", realism: "70", other: "0", strend: "0", tollRisk: "10", tollMargin: "5",
+};
+const rfqCfg = () => ({ ...RFQ_DEFAULTS, ...(cfg.rfq || {}) });
+const saveRfq = (patch) => saveCfg({ rfq: { ...rfqCfg(), ...patch } });
+const defaultRfqStart = (today) => `Cal${String((ymd(today).y + 1) % 100).padStart(2, "0")}`;
+const numOr = (x, dflt) => { const v = dec(x); return isFinite(v) ? v : dflt; };
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+const rfqDocs = {};   // "ZONE-YEAR" -> long-history document | "loading" | { error }
+async function loadDoc(zone, year) {
+  const key = `${zone}-${year}`;
+  if (!connected() || rfqDocs[key]) return;
+  rfqDocs[key] = "loading";
+  const name = `long-${key}.json`;
+  const cached = await cacheGet(name);
+  if (cached) { try { rfqDocs[key] = JSON.parse(cached.text); } catch { /* stale */ } }
+  // a finished year doesn't change once fetched; this year's file grows every week
+  if (rfqDocs[key] !== "loading" && year < ymd(todayIn(TZ)).y) { if (state.tab === "rfq") render(); return; }
+  try {
+    const text = await gh(contentsPath(`long/${zone}/${year}.json`, { ...cfg, branch: DATA_BRANCH }), RAW);
+    rfqDocs[key] = JSON.parse(text);
+    cachePut(name, text);
+  } catch (e) {
+    if (rfqDocs[key] === "loading") rfqDocs[key] = { error: e.status === 404 ? "not fetched yet" : e.message };
+  }
+  if (state.tab === "rfq") render();
+}
+
+// History's own trend in a capture rate: the slope over the last four complete years, in points a year.
+function captureTrend(stats, kind) {
+  const ys = Object.keys(stats.years).map(Number).sort((a, b) => a - b)
+    .filter((y) => stats.years[y].full && stats.years[y].capture?.[kind]?.rate_year != null).slice(-4);
+  if (ys.length < 3) return null;
+  const vs = ys.map((y) => stats.years[y].capture[kind].rate_year), mx = ys.reduce((a, b) => a + b, 0) / ys.length, mv = vs.reduce((a, b) => a + b, 0) / vs.length;
+  let sxy = 0, sxx = 0;
+  ys.forEach((x, i) => { sxy += (x - mx) * (vs[i] - mv); sxx += (x - mx) ** 2; });
+  return { from: ys[0], to: ys[ys.length - 1], slope: 100 * sxy / sxx };
+}
+
+const rfqMemo = { curveKey: null, curve: null, monthsKey: null, months: null };
+
+function viewRfq() {
+  const cc = curveCfg(), zone = CURVE_ZONES.includes(cc.zone) ? cc.zone : "DE", rc = rfqCfg();
+  if (connected()) loadCurveStats(zone);
+  const raw = curveStats[zone], stats = statsReady(raw) ? raw : null;
+  const allYears = stats ? Object.keys(stats.years).map(Number).sort((a, b) => a - b) : [];
+  const years = (cc.years || (stats ? defaultYears(stats) : [])).filter((y) => allYears.includes(y));
+  if (stats) for (const y of years) loadDoc(zone, y);
+  const quotes = (cc.quotes[zone] || []).map((q) => ({ product: (q.product || "").trim(), base: num0(q.base), peak: num0(q.peak) }))
+    .filter((q) => q.product && (q.base != null || q.peak != null));
+  const deal = ["solar", "wind", "toll"].includes(rc.deal) ? rc.deal : "solar";
+  const out = h("div", { class: "rfq-out", "aria-live": "polite" });
+  const later = debounce(() => compute(), 300);
+  const today = todayIn(TZ);
+
+  const zoneSel = h("select", { class: "select", "aria-label": "Zone", onchange: (e) => { saveCurve({ zone: e.target.value }); render(); } },
+    CURVE_ZONES.map((z) => h("option", { value: z, selected: z === zone || null }, `${z} · ${ZONE_NAME[z]}`)));
+  const yearChips = stats ? h("div", { class: "chips", role: "group", "aria-label": "History years" }, allYears.map((y) => h("button", {
+    type: "button", class: "chip", "aria-pressed": String(years.includes(y)),
+    onclick: () => { const next = years.includes(y) ? years.filter((x) => x !== y) : [...years, y].sort(); saveCurve({ years: next.length ? next : null }); render(); },
+  }, String(y) + (stats.years[String(y)].full ? "" : " so far")))) : null;
+
+  const field = (label, key, { hint, ph } = {}) => h("label", { class: "field" }, h("span", { text: label }),
+    h("input", { class: "input", type: "text", inputmode: "decimal", value: rfqCfg()[key], placeholder: ph || null, autocomplete: "off", spellcheck: "false",
+      oninput: (e) => { saveRfq({ [key]: e.target.value }); later(); } }),
+    hint ? h("small", { class: "hint", text: hint }) : null);
+  const yieldKey = `${deal}-${zone}`, yieldDefault = deal === "wind" ? YIELD_WIND : YIELD_SOLAR[zone] || 1000;
+  const yieldField = h("label", { class: "field" }, h("span", { text: "Yield, MWh per MW a year" }),
+    h("input", { class: "input", type: "text", inputmode: "decimal", value: rc.yields[yieldKey] ?? String(yieldDefault), autocomplete: "off",
+      oninput: (e) => { saveRfq({ yields: { ...rfqCfg().yields, [yieldKey]: e.target.value } }); later(); } }),
+    h("small", { class: "hint", text: "P50, for the volume only" }));
+  const startField = field("Start", "start", { ph: defaultRfqStart(today), hint: "a month, quarter or year: Jan27, Q3-27, Cal28" });
+
+  let form;
+  if (deal === "toll") {
+    form = [
+      h("div", { class: "filters" },
+        seg("Duration", [{ value: "1", label: "1 hour" }, { value: "2", label: "2 hours" }, { value: "4", label: "4 hours" }], String(rc.bh), (v) => { saveRfq({ bh: v }); render(); }),
+        seg("Cycles", [{ value: "1", label: "1 cycle a day" }, { value: "2", label: "2 cycles a day" }], String(rc.cycles), (v) => { saveRfq({ cycles: v }); render(); })),
+      h("div", { class: "form-grid even" },
+        startField, field("Years", "tollYears"), field("Power, MW", "bessMw"), field("Round trip, %", "rt"), field("Availability, %", "avail"),
+        field("Degradation, % a year", "bessDeg"), field("Extrinsic captured, %", "realism", { hint: "trading never sees tomorrow" }),
+        field("Other revenue, €/MW a year", "other", { hint: "ancillary, intraday: your own figure" }), field("Spread trend, % a year", "strend", { hint: "more batteries, flatter days" }),
+        field("Risk premium, %", "tollRisk"), field("Margin, %", "tollMargin"), field("Prices past the curve, % a year", "growth"), field("Discount rate, %", "discount")),
+    ];
+  } else {
+    const tr = stats ? captureTrend(stats, deal) : null;
+    form = [
+      h("div", { class: "filters" },
+        seg("Below zero", [{ value: "paid", label: "Paid in every hour" }, { value: "curtailed", label: "Curtailed below zero" }], rc.neg, (v) => { saveRfq({ neg: v }); render(); })),
+      h("div", { class: "form-grid even" },
+        startField, field("Years", "ppaYears"), field("Capacity, MW", "ppaMw"), yieldField,
+        field("Output loss, % a year", deal === "solar" ? "pvDeg" : "windDeg"),
+        field("Capture-rate trend, points a year", "trend", { hint: tr ? `history ${tr.from}–${String(tr.to).slice(2)}: ${signed(tr.slope, p1)} a year` : "from the middle of the history years" }),
+        field("Balancing, €/MWh", deal === "solar" ? "balSolar" : "balWind"), field("Risk premium, €/MWh", "ppaRisk"), field("Margin, €/MWh", "ppaMargin"),
+        field("Prices past the curve, % a year", "growth"), field("Discount rate, %", "discount")),
+    ];
+  }
+
+  function message(text, cls = "empty") {
+    const t = text.charAt(0).toUpperCase() + text.slice(1);
+    out.replaceChildren(h("p", { class: cls, text: /[.…)]$/.test(t) ? t : `${t}.` }));
+  }
+  function compute() {
+    const c = rfqCfg(), cc2 = curveCfg();
+    if (!connected()) return message("Pricing a deal needs this zone's history: connect the brief in Settings.");
+    if (!stats) return message(!raw || raw === "loading" ? "Loading this zone's history…" : `No history for this zone yet (${raw.error}).`);
+    if (!quotes.length) {
+      return out.replaceChildren(h("p", { class: "empty", text: "Pricing needs a curve: type quotes for this zone on the Curve tab, or start from the example values (made up, not market prices)." }),
+        h("div", { class: "row-btns" },
+          h("button", { type: "button", class: "btn ghost small", onclick: () => { saveCurve({ quotes: { ...curveCfg().quotes, [zone]: EXAMPLE_QUOTES.map((q) => ({ ...q })) } }); render(); } }, "Fill in example values"),
+          h("a", { class: "linkish", href: "#/curve" }, "Open the Curve tab")));
+    }
+    const docs = {}, pending = [], failed = [];
+    for (const y of years) {
+      const d = rfqDocs[`${zone}-${y}`];
+      if (d == null || d === "loading") pending.push(y);
+      else if (d.error) failed.push(`${y}: ${d.error}`);
+      else docs[y] = d;
+    }
+    if (pending.length) return message(`Loading hourly history for ${pending.join(", ")}…`);
+    if (!Object.keys(docs).length) return message(`No hourly history for the chosen years (${failed.join("; ")}).`, "warn-text");
+    let start;
+    try { const { y, m } = ymd(parse(c.start || defaultRfqStart(today), today).start); start = dayNum(y, m, 1); }
+    catch (e) { return message(`Start: ${e.message}`, "warn-text"); }
+    const yrs = Math.round(clamp(numOr(deal === "toll" ? c.tollYears : c.ppaYears, deal === "toll" ? 7 : 10), 1, 15));
+    const months = 12 * yrs, growth = numOr(c.growth, 2) / 100, discount = numOr(c.discount, 5) / 100;
+    const curveKey = JSON.stringify([zone, stats.generated_utc, quotes, years, cc2.mode, start, months, growth]);
+    try {
+      if (rfqMemo.curveKey !== curveKey) {
+        rfqMemo.curve = rfq.tenorCurve(quotes, CURVE_MARKET(zone), stats, years, cc2.mode, start, months, growth);
+        rfqMemo.curveKey = curveKey; rfqMemo.monthsKey = null;
+      }
+      const { cv, assumed } = rfqMemo.curve;
+      if (!cv.months.length) return message(cv.notes.join(" ") || "The quotes don't build a curve.", "warn-text");
+      const docKey = Object.keys(docs).join(",");
+      if (deal === "toll") {
+        const hours = [1, 2, 4].includes(+c.bh) ? +c.bh : 2, cycles = +c.cycles === 2 ? 2 : 1, rt = clamp(numOr(c.rt, 85) / 100, 0.5, 1);
+        const key = `${curveKey}|toll|${hours}|${cycles}|${rt}|${docKey}`;
+        if (rfqMemo.monthsKey !== key) { rfqMemo.months = rfq.tollMonths(cv, docs, years, { start, months, hours, round_trip: rt, cycles, today }); rfqMemo.monthsKey = key; }
+        const r = rfq.tollValue(rfqMemo.months, {
+          availability: clamp(numOr(c.avail, 97) / 100, 0, 1), degradation: clamp(numOr(c.bessDeg, 2) / 100, 0, 0.5),
+          realism: clamp(numOr(c.realism, 70) / 100, 0, 1), other: numOr(c.other, 0), trend: numOr(c.strend, 0) / 100,
+          risk: clamp(numOr(c.tollRisk, 10) / 100, 0, 0.9), margin: clamp(numOr(c.tollMargin, 5) / 100, 0, 0.9), discount, today });
+        out.replaceChildren(...tollResult(r, { mw: numOr(c.bessMw, 50), hours, cycles, assumed, cv, stats, zone }));
+      } else {
+        const key = `${curveKey}|${deal}|${docKey}`;
+        if (rfqMemo.monthsKey !== key) { rfqMemo.months = rfq.ppaMonths(cv, docs, stats, years, { kind: deal, start, months, today }); rfqMemo.monthsKey = key; }
+        const r = rfq.ppaValue(rfqMemo.months, {
+          capacity: numOr(c.ppaMw, 50), yield_mwh: numOr(c.yields[yieldKey], yieldDefault),
+          degradation: clamp(numOr(deal === "solar" ? c.pvDeg : c.windDeg, deal === "solar" ? 0.5 : 0) / 100, 0, 0.5),
+          curtail: c.neg === "curtailed", balancing: numOr(deal === "solar" ? c.balSolar : c.balWind, deal === "solar" ? 2 : 3),
+          risk: numOr(c.ppaRisk, 1.5), margin: numOr(c.ppaMargin, 1), trend: numOr(c.trend, 0) / 100, discount, today });
+        out.replaceChildren(...ppaResult(r, { months, assumed, cv, stats, deal }));
+      }
+      if (failed.length) out.appendChild(h("p", { class: "note", text: `No hourly history for ${failed.join("; ")}: the scenarios use the other years.` }));
+    } catch (e) { message(e.message, "warn-text"); }
+  }
+
+  const head = section("rfq-head", kicker("Pricing a deal against your curve"), h("h1", { class: "headline", text: "RfQ" }),
+    h("p", { class: "lede", text: "What you could offer for a solar or wind PPA or a battery toll, built step by step from the forward curve on the Curve tab and from how each history year behaved around it." }),
+    h("div", { class: "filters" }, h("label", { class: "inline-field" }, h("span", { text: "Zone" }), zoneSel),
+      seg("Deal", [{ value: "solar", label: "Solar PPA" }, { value: "wind", label: "Wind PPA" }, { value: "toll", label: "Battery toll" }], deal,
+        (v) => { saveRfq({ deal: v }); render(); })),
+    h("p", { class: "note" }, quotes.length ? `Prices: your ${quotes.length} quote${quotes.length > 1 ? "s" : ""} for ${zone}, shaped ${cc.mode === "additive" ? "in fixed €/MWh" : "to scale with price"}. ` : "",
+      h("a", { class: "linkish", href: "#/curve" }, quotes.length ? "Edit them on the Curve tab" : "Type quotes on the Curve tab")),
+    stats ? h("div", null, h("p", { class: "note", text: "History years, the scenarios (shared with the Curve tab):" }), yearChips) : null);
+  const ready = connected() && stats && quotes.length;   // nothing to fill in until there's a curve to price against
+  const view = h("div", { class: "rfq" }, head, ready ? section("rfq-form", ...form) : null, section("rfq-results", out));
+  compute();
+  return view;
+}
+
+const contractLabel = (from, startMonthIsJan) => (startMonthIsJan ? String(ymd(from).y) : `${MONTH_ABBR[ymd(from).m - 1]}-${String(ymd(from).y % 100).padStart(2, "0")} on`);
+function assumedNote(assumed, cv, growthPct) {
+  if (!assumed.length) return null;
+  const first = assumed[0];
+  return h("p", { class: "note", text: `Past your last quote the curve is an assumption: ${first.product.replace("Cal", "Cal-")} at ${p2(first.base)} €/MWh base, the level of the curve's last twelve months, then ${growthPct} a year to ${assumed[assumed.length - 1].product.replace("Cal", "Cal-")}.` });
+}
+
+function ppaResult(r, { months, assumed, cv, stats, deal }) {
+  const base = r.steps[0].value, perYear = r.volume / (months / 12);
+  const solar = deal === "solar";
+  const box = h("div", { class: "chart-box" });
+  waterfallChart(box, { steps: r.steps, fmt: p2, unit: "€/MWh", label: `From the base price to the offer, ${solar ? "solar" : "wind"} PPA` });
+  const kids = [
+    h("div", { class: "rfq-block" },
+      h("div", { class: "stats" },
+        stat("Offer", p2(r.offer), "€/MWh, every MWh delivered"),
+        stat("Fair value", p2(r.fair), "before risk and margin"),
+        stat("Against base", pct(r.offer / base, 0), `of ${p2(base)} base`),
+        stat("Output", `${p1(perYear / 1000)} GWh`, r.curtailed > 0.0005 ? `a year, ${pct(r.curtailed, 1)} curtailed` : "a year")),
+      h("h2", { class: "h2", text: "From base to offer" }), box,
+      h("p", { class: "note", text: solar
+        ? "Seasons and hours come from the curve: a solar plant sells most in summer and around midday, when power is cheap. Weather comes from history: on sunny days midday is cheaper than the average day says, which the curve's average shape can't see."
+        : "Seasons and hours come from the curve: wind blows more in winter, when power is dear, and at any hour. Weather comes from history: windy hours are cheap hours, because every turbine in the zone produces at once, which the curve's average shape can't see." }),
+      r.steps.some((s) => s.key === "negative") ? h("p", { class: "note", text: `Curtailed below zero: the plant stops, and isn't paid, when the price is negative. It loses ${pct(r.curtailed, 1)} of its output, but the hours it keeps are dearer, so the price per MWh rises.` }) : null,
+      h("p", { class: "note", text: `The trend moves the capture rate a little each year, counted from ${+r.y_ref.toFixed(1)}, the middle of the history years. Balancing, risk and margin come off every MWh: the buyer takes the price and volume risk for the whole tenor.` }),
+      assumedNote(assumed, cv, pct(numOr(rfqCfg().growth, 2) / 100, 1)),
+      ...r.notes.map((n) => h("p", { class: "note", text: n }))),
+  ];
+  const rows = r.years.map((y) => h("tr", null, h("th", { scope: "row", text: String(y.year) + (y.months < 12 ? ` (${y.months} months)` : "") }),
+    num(p2(y.base)), num(pct(y.rate_curve, 0)), num(pct(y.rate, 0)), num(y.rate_min != null ? `${pct(y.rate_min, 0)}–${pct(y.rate_max, 0)}` : "—", "wide"), num(p2(y.fair))));
+  kids.push(h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: "Year by year" }),
+    table(["Year", "Base", "Curve", "History", h("th", { class: "wide", text: "Range" }), "Fair"], rows, { cls: "wrap", caption: "Base price, capture rates and fair price by year" }),
+    h("p", { class: "note", text: "Curve and history are capture rates, what the output earns over the base price: on the curve's average days, and on the history years' real ones (their average, and the range from one year to another). Base and fair in €/MWh; the fair price includes curtailment, the trend and balancing." })));
+  kids.push(scenarioBlock(r.scenarios.map((s) => ({ year: s.year, v: s.fair })), r.fair, p2, "€/MWh", stats));
+  return kids;
+}
+
+function tollResult(r, { mw, hours, cycles, assumed, cv, stats }) {
+  const box = h("div", { class: "chart-box" });
+  waterfallChart(box, { steps: r.steps, fmt: eur, unit: "€ per MW a year", label: "From intrinsic value to the toll offer" });
+  const janStart = ymd(r.start).m === 1;
+  const kids = [
+    h("div", { class: "rfq-block" },
+      h("div", { class: "stats" },
+        stat("Toll offer", eur(r.offer), "per MW a year"),
+        stat("Per day", eur(r.offer / 365), "per MW"),
+        stat("For the project", eur(r.offer * mw), `a year, ${upTo2.format(mw)} MW`),
+        stat("Intrinsic share", pct(r.intrinsic / r.spot, 0), "of perfect foresight"),
+        stat("Cycles a day", r.cycles_per_day != null ? p2(r.cycles_per_day) : "—", `of ${cycles} allowed`)),
+      h("h2", { class: "h2", text: "From intrinsic value to offer" }), box,
+      h("p", { class: "note", text: `Intrinsic: a ${hours}-hour battery dispatched on the curve's average days. Forwards can lock much of it in today. Extrinsic: the same battery on each history year's real days, rescaled to your curve, knowing every day's prices in advance; real days swing around the average, so it earns more, but trading only captures part of it.` }),
+      h("p", { class: "note", text: "Day-ahead only, in whole hours, each day starting and ending empty. Intraday trading, 15-minute products and balancing services aren't modelled: put your own figure under Other revenue." }),
+      assumedNote(assumed, cv, pct(numOr(rfqCfg().growth, 2) / 100, 1)),
+      ...r.notes.map((n) => h("p", { class: "note", text: n }))),
+  ];
+  const rows = r.years.map((y) => h("tr", null, h("th", { scope: "row", text: contractLabel(y.from, janStart) + (y.months < 12 ? ` (${y.months} months)` : "") }),
+    num(eur(y.intrinsic)), num(eur(y.spot)), num(y.spot_min != null ? `${eur(y.spot_min)}–${eur(y.spot_max)}` : "—", "wide"), num(eur(y.net))));
+  kids.push(h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: "Year by year" }),
+    table(["Year", "Intrinsic", "Perfect foresight", h("th", { class: "wide", text: "Range" }), "Expected"], rows, { cls: "wrap", caption: "Battery value by contract year, € per MW" }),
+    h("p", { class: "note", text: "€ per MW. Perfect foresight is the average of the history years (range: each year on its own). Expected keeps the intrinsic value and the captured share of the extrinsic, after availability, degradation and the trend, plus other revenue: before risk and margin." })));
+  kids.push(scenarioBlock(r.scenarios.map((s) => ({ year: s.year, v: s.value })), runningBefore(r.steps, "risk"), eur, "€ per MW a year", stats));
+  return kids;
+}
+
+// The bridge's running total just before the step `key` (what risk and margin are taken from).
+function runningBefore(steps, key) {
+  let run = 0;
+  for (const s of steps) { if (s.key === key) break; run = s.total ? s.value : run + s.value; }
+  return run;
+}
+
+// One row per history year: the deal priced as if every year looked like that one.
+function scenarioBlock(items, ref, fmt, unit, stats) {
+  if (!items.length) return null;
+  const rows = items.map((s) => h("tr", null, h("th", { scope: "row", text: stats.years[String(s.year)]?.full ? String(s.year) : `${s.year} so far` }),
+    num(fmt(s.v)), num(signed(s.v - ref, fmt))));
+  return h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: "If every year looked like…" }),
+    table(["History year", `Value, ${unit}`, "Against the average"], rows, { cls: "wrap", caption: "The deal priced on each history year alone" }),
+    h("p", { class: "note", text: "Each row prices the whole tenor on one history year's days alone, before risk and margin. The spread is a first look at how much the shape of the year matters: what the risk premium is there to pay for." }));
 }
 
 // ------------------------------------------------------------------ Options

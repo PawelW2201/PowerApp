@@ -473,3 +473,79 @@ export function legend(items) {
   for (const it of items) row.appendChild(keyed(it.name, it.color, null, !it.dot));
   return row;
 }
+
+/**
+ * waterfallChart(container, opts): a bridge from one total to another, one row per step.
+ *  opts.steps  [{ label, value, total }]: a total sets the running sum (drawn from zero), a step
+ *              moves it (drawn between the sums before and after)
+ *  opts.fmt    value formatter; steps get a sign
+ *  opts.unit   shown in the readout
+ *  opts.label  accessible description
+ * Rows are HTML, so long labels wrap on a phone; every value is printed, the readout gives the
+ * running sum of the row under the pointer or focus.
+ */
+export function waterfallChart(container, opts) {
+  const fmt = opts.fmt || String, steps = opts.steps;
+  const root = el("div", "chart wf-chart");
+  const head = el("div", "chart-readout");
+  const rows = el("div", "wf");
+  rows.setAttribute("role", "table");
+  rows.setAttribute("aria-label", opts.label || "Bridge");
+  root.append(head, rows);
+  container.appendChild(root);
+  // running sums
+  let run = 0;
+  const spans = steps.map((s) => {
+    const a = s.total ? 0 : run, b = s.total ? s.value : run + s.value;
+    run = s.total ? s.value : run + s.value;
+    return { a, b, after: run };
+  });
+  let lo = 0, hi = 0;
+  for (const sp of spans) { lo = Math.min(lo, sp.a, sp.b); hi = Math.max(hi, sp.a, sp.b); }
+  if (hi === lo) hi = lo + 1;
+  const pad = (hi - lo) * 0.03;
+  lo = lo < 0 ? lo - pad : lo; hi += pad;
+  const pct = (v) => ((v - lo) / (hi - lo)) * 100;
+  const readout = (i) => {
+    head.replaceChildren();
+    const left = el("div", "ro-vals");
+    if (i == null) left.appendChild(el("span", "muted", "Point at a step for the running total"));
+    else {
+      const s = steps[i];
+      const it = el("span", "ro-item");
+      it.append(el("span", null, s.label), el("b", null, s.total ? fmt(s.value) : `${s.value > 0 ? "+" : ""}${fmt(s.value)}`));
+      left.appendChild(it);
+      if (!s.total) { const r = el("span", "ro-item"); r.append(el("span", null, "after it"), el("b", null, fmt(spans[i].after))); left.appendChild(r); }
+    }
+    head.append(left, el("span", "ro-date", opts.unit || ""));
+  };
+  steps.forEach((s, i) => {
+    const sp = spans[i], kind = s.total ? "total" : s.value >= 0 ? "up" : "down";
+    const row = el("div", `wf-row ${kind}`);
+    row.setAttribute("role", "row");
+    row.tabIndex = 0;
+    const lab = el("span", "wf-label", s.label);
+    lab.setAttribute("role", "rowheader");
+    const track = el("span", "wf-track");
+    track.setAttribute("role", "cell");
+    if (lo < 0) { const z = el("i", "wf-zero"); z.style.left = `${pct(0)}%`; track.appendChild(z); }
+    if (s.total || Math.abs(s.value) > 1e-9) {        // a step of nothing gets no bar
+      const bar = el("i", "wf-bar");
+      const x0 = pct(Math.min(sp.a, sp.b)), x1 = pct(Math.max(sp.a, sp.b));
+      bar.style.left = `${x0}%`;
+      bar.style.width = `${Math.max(x1 - x0, 0.6)}%`;
+      track.appendChild(bar);
+    }
+    const val = el("span", "wf-val", s.total ? fmt(s.value) : `${s.value > 0 ? "+" : ""}${fmt(s.value)}`);
+    val.setAttribute("role", "cell");
+    row.append(lab, track, val);
+    const on = () => readout(i), off = () => readout(null);
+    row.addEventListener("pointerenter", on);
+    row.addEventListener("pointerleave", off);
+    row.addEventListener("focus", on);
+    row.addEventListener("blur", off);
+    rows.appendChild(row);
+  });
+  readout(null);
+  return { root, destroy() { root.remove(); } };
+}
