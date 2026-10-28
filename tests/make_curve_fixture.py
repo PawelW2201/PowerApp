@@ -38,6 +38,7 @@ CASES = [
     ([("Q1-27", 100.0, None), ("Q2-27", 80.0, None), ("Q3-27", 80.0, None), ("Q4-27", 90.0, None), ("Cal27", 85.0, None)], "DE", [2025], "additive"),
     ([("Sum27", 70.0, 60.0), ("Win27", 95.0, None), ("Cal28", 82.0, 90.0)], "PL", [2024, 2025], "multiplicative"),
     ([("Cal27", 85.0, None)], "FR", [], "multiplicative"),
+    ([("Q2-27", 20.0, -5.0), ("Cal27", 60.0, None)], "DE", [2024, 2025], "multiplicative"),   # a block below zero
 ]
 out = []
 for quotes, market, years, mode in CASES:

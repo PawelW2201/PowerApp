@@ -254,7 +254,8 @@ export function build(quotes, marketCode = "DE", stats = null, years = [], mode 
       if (!idx.length) continue;
       let sf = 0; for (const i of idx) sf += f[i];
       const meanF = sf / idx.length;
-      if (mode === "multiplicative" && meanF > 0.05) for (const i of idx) vals[i] = target * f[i] / meanF;
+      // scaling a block priced at or below zero would turn its shape upside down, so those go additive
+      if (mode === "multiplicative" && meanF > 0.05 && target > 0) for (const i of idx) vals[i] = target * f[i] / meanF;
       else for (const i of idx) vals[i] = target + (f[i] - meanF) * mb;
     }
     hs.forEach((row, i) => { t.push(row[0]); day.push(row[1]); hour.push(row[2]); peak.push(row[4]); price.push(vals[i]); });
