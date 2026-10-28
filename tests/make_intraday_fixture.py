@@ -20,6 +20,10 @@ CASES = [
      dict(hours=1, round_trip=0.9, cycles=1), 30, 3),
     ("four hours on a coarse grid", dict(sigma=5.0, phi=0.5, per_day=3.0, size=60.0, length=1.5, shape=0.9, cost=3.0, levels=9, bins=2),
      dict(hours=4, round_trip=0.85, cycles=2), 20, 5),
+    ("a grid fee on charging, cheap trading", dict(sigma=8.0, phi=0.8, per_day=1.5, size=100.0, length=2.0, shape=0.8, cost=0.25),
+     dict(hours=2, round_trip=0.85, cycles=2, fee=14.13), 30, 13),
+    ("one hour, a dear fee and costly trading", dict(sigma=12.0, phi=0.7, per_day=2.5, size=90.0, length=1.5, shape=0.6, cost=2.0),
+     dict(hours=1, round_trip=0.9, cycles=2, fee=30.0), 25, 17),
 ]
 
 
@@ -36,7 +40,8 @@ for name, wkw, bkw, days, seed in CASES:
     quotes = [[h, t, x, w.quote(h, t, x)] for h, t, x in ((5, 2, 0), (20, 13, w.nx - 1), (9, 8, w.nx // 2 + 1))]
     ex = r["example"]
     cases.append({
-        "name": name, "world": js_world(wkw), "battery": {"hours": bkw["hours"], "roundTrip": bkw["round_trip"], "cycles": bkw["cycles"]},
+        "name": name, "world": js_world(wkw),
+        "battery": {"hours": bkw["hours"], "roundTrip": bkw["round_trip"], "cycles": bkw["cycles"], "fee": bkw.get("fee", 0.0)},
         "days": days, "seed": seed,
         "drift": w.drift, "jump": w.jump, "comp": w.comp, "mean_id": w.mean_id, "quotes": quotes,
         "pd_row": w.pd[len(w.drift) // 2], "ps_row": w.ps[20][0],

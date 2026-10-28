@@ -485,7 +485,8 @@ export function legend(items) {
  * running sum of the row under the pointer or focus.
  */
 export function waterfallChart(container, opts) {
-  const fmt = opts.fmt || String, steps = opts.steps;
+  // a step that is zero up to rounding dust shows as zero, not "−€0"
+  const fmt = opts.fmt || String, steps = opts.steps.map((s) => (Math.abs(s.value) < 1e-6 ? { ...s, value: 0 } : s));
   const root = el("div", "chart wf-chart");
   const head = el("div", "chart-readout");
   const rows = el("div", "wf");

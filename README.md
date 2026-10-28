@@ -19,7 +19,9 @@ how European power markets work on public data.
   scenario, so you also see how much the deal moves from one kind of year to another. The battery's cycle limit is
   the contract's average a day over each contract year (1 to 2), with the offer for every limit side by side, and
   its size matters: its own trades move the price against it (an impact estimated from the zone's history), so a
-  chart shows € per MW falling as the battery grows. The same battery can carry a revenue floor instead: a put on
+  chart shows € per MW falling as the battery grows. Where the grid charges for energy drawn to charge (Hungary's
+  14.13 €/MWh is filled in; type any zone's), every cycle has to beat it, and the bridge shows what it costs after
+  the battery drops the spreads that no longer pay. The same battery can carry a revenue floor instead: a put on
   each year's revenue, priced with Black-76, with the fee, the chance it pays, and the share of upside that would
   pay for it instead (a zero-cost collar).
 - **Options** works on its own too: options on a future (Black-76 or Bachelier, greeks, implied vol, value against
@@ -30,7 +32,7 @@ how European power markets work on public data.
   away from day-ahead and spike when something breaks (all made up, fair on average). Four ways to run it on the
   same simulated days: keep the day-ahead schedule, re-plan every hour and trade at once (a rolling LP), trade each
   hour at its close with the optimal policy (a dynamic programme), or know every price in advance. The day comes
-  from your curve or is made up; you set the drift, the spikes and the trading cost.
+  from your curve or is made up; you set the drift, the spikes, the trading cost and the grid fee on charging.
 
 This repository holds **only the app's code**. It contains no data: when you open Today, the app reads
 `summary.json` from the `dashboard-data` branch of your private PowerDesk repository, and Curve and RfQ read the

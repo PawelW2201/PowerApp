@@ -10,7 +10,8 @@
 // market quotes it at its expected final price.
 //
 // The battery sells its day-ahead schedule in the auction; every MWh traded in intraday after that
-// costs `cost`. Day-ahead keeps the schedule. The rolling LP, every hour, plans the rest of the day on
+// costs `cost`, and every MWh it ends up drawing from the grid to charge pays the grid `fee` (a cost
+// of the physical schedule, not of trading). Day-ahead keeps the schedule. The rolling LP, every hour, plans the rest of the day on
 // the quotes and trades the plan at once, changing it later only when the new plan beats the old by
 // more than what the trades cost. The patient trader trades each hour only when it closes, choosing by
 // a dynamic programme over the hour, the charge, the cycles used and the state of the world. The oracle
@@ -132,7 +133,8 @@ export function world(da, { sigma = 8.0, phi = 0.8, perDay = 1.0, size = 80.0, l
 }
 
 // ------------------------------------------------------------------ the battery
-export function battery({ hours = 2, roundTrip = 0.85, cycles = 2 } = {}) {
+// `fee`: EUR per MWh drawn from the grid to charge (a grid tariff), paid on the physical schedule.
+export function battery({ hours = 2, roundTrip = 0.85, cycles = 2, fee = 0.0 } = {}) {
   const E = hours, cap = Math.round(cycles * hours), s = Math.sqrt(roundTrip);
   const states = [];
   for (let soc = 0; soc <= E; soc++) for (let dis = 0; dis <= cap; dis++) states.push([soc, dis]);
@@ -142,9 +144,10 @@ export function battery({ hours = 2, roundTrip = 0.85, cycles = 2 } = {}) {
   const up = Int32Array.from(states, ([soc, dis]) => (soc < E ? idx(soc + 1, dis) : -1));
   const down = Int32Array.from(states, ([soc, dis]) => (soc > 0 && dis < cap ? idx(soc - 1, dis + 1) : -1));
   return {
-    hours: E, cap, s, states, idx, socOf, disOf, up, down,
+    hours: E, cap, s, fee, states, idx, socOf, disOf, up, down,
     ok: (n, h, soc, dis) => soc <= n - h && soc + dis <= cap && (h < n || soc === 0),
     grid: (a) => (a === DISCHARGE ? s : a === CHARGE ? -1 / s : 0.0),
+    imports: (a) => (a === CHARGE ? 1 / s : 0.0),       // MWh drawn from the grid, which pay the fee
     moves: (soc, dis) => {
       const out = [[IDLE, soc, dis]];
       if (soc < E) out.push([CHARGE, soc + 1, dis]);
@@ -165,7 +168,8 @@ export function pick(cands) {
   }
   return [bestA, bestV];
 }
-const reward = (b, a, p, ref, cost) => { const g = b.grid(a); return ref == null ? g * p : g * p - cost * Math.abs(g - ref); };
+// An hour's cash: grid MWh at price p, less the grid fee on charging, less trading costs on the change from `ref`.
+const reward = (b, a, p, ref, cost) => { const g = b.grid(a), v = g * p - b.fee * b.imports(a); return ref == null ? v : v - cost * Math.abs(g - ref); };
 
 // pick() over idle, charge and discharge without building arrays: values to go (NEG: not allowed)
 // plus this hour's rewards. Returns the action; the chosen value is left in `chosen`.
@@ -267,7 +271,8 @@ export function patient(w, b, ref) {
   return [acts, total];
 }
 
-// The rolling LP on one day's states: [intraday cash after costs, MWh traded, actions].
+// The rolling LP on one day's states: [intraday cash after trading costs and the change in grid fees
+// from the day-ahead schedule's, MWh traded, actions].
 export function rollingDay(w, b, xs, daActs) {
   const n = w.da.length, pos = daActs.slice(), q = new Float64Array(n);
   let cash = 0.0, traded = 0.0, soc = 0, dis = 0;
@@ -278,8 +283,9 @@ export function rollingDay(w, b, xs, daActs) {
     const d = [];
     for (let h = t; h < n; h++) d.push(b.grid(nw[h - t]) - b.grid(pos[h]));
     let vol = 0; for (const v of d) vol += Math.abs(v);
+    let more = 0; for (let h = t; h < n; h++) more += b.imports(nw[h - t]) - b.imports(pos[h]);   // MWh charged, new plan over old
     let g = 0; for (let j = 0; j < d.length; j++) g += d[j] * q[t + j];
-    const gain = g - w.cost * vol;
+    const gain = g - w.cost * vol - b.fee * more;
     if (gain > 1e-9) { cash += gain; traded += vol; for (let h = t; h < n; h++) pos[h] = nw[h - t]; }
     [soc, dis] = step(pos[t], soc, dis);
   }
@@ -292,12 +298,14 @@ function pct(xs, q) {
 }
 
 // The four policies on the same simulated days (EUR per MW). Each settles its day-ahead schedule at
-// day-ahead prices and every change at intraday prices, less trading costs. `pat` reuses a solved
-// patient policy for the same world and battery.
+// day-ahead prices and every change at intraday prices, less trading costs, and pays the grid fee on
+// what it ends up charging. `pat` reuses a solved patient policy for the same world and battery.
 export function simulate(w, b, { days = 1000, seed = 7, pat = null } = {}) {
   const n = w.da.length, { ns, nd } = w;
   const daActs = bestPath(w.da, b), ref = daActs.map((a) => b.grid(a));
   let daCash = 0; for (let h = 0; h < n; h++) daCash += ref[h] * w.da[h];
+  let daImp = 0; for (const a of daActs) daImp += b.imports(a);
+  const daVal = daCash - b.fee * daImp;                                 // the day-ahead schedule's grid fees
   const [patActs, patReward] = pat || patient(w, b, ref);
   const rnd = rng(seed);
   const pl = Object.fromEntries(POLICIES.map((k) => [k, []])), vol = Object.fromEntries(POLICIES.map((k) => [k, []]));
@@ -313,11 +321,11 @@ export function simulate(w, b, { days = 1000, seed = 7, pat = null } = {}) {
     let soc = 0, dis = 0;
     acts.patient = xs.map((x, h) => { const a = patActs[h][b.idx(soc, dis)][x]; [soc, dis] = step(a, soc, dis); return a; });
     acts.oracle = bestPath(ida, b, 0, 0, 0, ref, w.cost);
-    const vals = { day_ahead: daCash, rolling: daCash + cash };
+    const vals = { day_ahead: daVal, rolling: daVal + cash };
     vol.day_ahead.push(0.0); vol.rolling.push(traded);
     for (const name of ["patient", "oracle"]) {
       let c = 0, t = 0;
-      acts[name].forEach((a, h) => { const d = b.grid(a) - ref[h]; c += d * ida[h] - w.cost * Math.abs(d); t += Math.abs(d); });
+      acts[name].forEach((a, h) => { const d = b.grid(a) - ref[h]; c += d * ida[h] - w.cost * Math.abs(d) - b.fee * b.imports(a); t += Math.abs(d); });
       vals[name] = daCash + c; vol[name].push(t);
     }
     for (const name of POLICIES) pl[name].push(vals[name]);
@@ -332,8 +340,8 @@ export function simulate(w, b, { days = 1000, seed = 7, pat = null } = {}) {
     out[name] = { mean: m, se: sd / Math.sqrt(xs.length), p10: pct(xs, 0.1), p90: pct(xs, 0.9), traded: sum(vol[name]) / vol[name].length };
   }
   let exp = 0; for (let h = 0; h < n; h++) exp += ref[h] * w.meanId[h];
-  out.day_ahead.expected = daCash;
-  out.patient.expected = daCash - exp + patReward;
+  out.day_ahead.expected = daVal;
+  out.patient.expected = daCash - exp + patReward;          // the programme's reward already carries its fees
   out.rolling.expected = out.rolling.mean;
   out.oracle.expected = out.oracle.mean;
   return { policies: out, days, example, dayAheadActions: daActs };

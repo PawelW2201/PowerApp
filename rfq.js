@@ -11,9 +11,11 @@
 // PPA (pay as produced): base over the tenor -> seasons -> daily shape on the curve -> weather ->
 // negative hours (if curtailed) -> capture-rate trend -> balancing -> risk -> margin = offer.
 // Toll (EUR/MW/year): intrinsic (the curve's daily shape) -> extrinsic (history's daily swings) ->
-// the share of it trading won't capture -> own price impact -> availability -> degradation ->
-// spread trend -> other revenue -> risk -> margin = offer. Both levelized with a discount rate,
-// monthly, mid-month.
+// the share of it trading won't capture -> grid fee on charging -> own price impact -> availability ->
+// degradation -> spread trend -> other revenue -> risk -> margin = offer. Both levelized with a
+// discount rate, monthly, mid-month.
+// Grid fee: a MWh drawn to charge costs its price plus the fee, so a MWh sold has to beat its buying
+// price by fee / rt more; the battery drops the spreads that no longer pay.
 // Cycles: the contract's limit is an average a day over each contract year, at most two in any one
 // day. Each day's best revenue is known for every whole MWh discharged, so a year's budget goes to
 // the steps up those revenue curves, best first (a Lagrangian; the last step is the shadow price).
@@ -48,10 +50,10 @@ export const CYCLE_OPTIONS = [1.0, 1.1, 1.2, 1.3, 1.5, 2.0];  // average cycles 
 // The best revenue of one day for each whole number q of MWh discharged, q = 0 to maxCycles x hours:
 // a 1 MW battery holding `hours` MWh, empty at the start and the end, 1 MWh an hour. Charging 1 MWh
 // buys 1/sqrt(rt) from the grid, discharging sells sqrt(rt); `impact` is how far its own full power
-// moves the price (EUR/MWh), so it sells that much lower and buys that much higher. -Infinity where
-// q can't be reached.
+// moves the price (EUR/MWh), so it sells that much lower and buys that much higher; `fee` is the grid's
+// charge on every MWh drawn to charge (EUR/MWh). -Infinity where q can't be reached.
 let bufA = new Float64Array(0), bufB = new Float64Array(0);
-export function batteryCurve(prices, hours, roundTrip = 0.85, impact = 0.0, maxCycles = DAILY_MAX) {
+export function batteryCurve(prices, hours, roundTrip = 0.85, impact = 0.0, maxCycles = DAILY_MAX, fee = 0.0) {
   const s = Math.sqrt(roundTrip), E = Math.trunc(hours), cap = Math.round(maxCycles * hours), w = cap + 1, size = (E + 1) * w;
   if (bufA.length < size) { bufA = new Float64Array(size); bufB = new Float64Array(size); }
   let V = bufA, W = bufB;
@@ -59,7 +61,7 @@ export function batteryCurve(prices, hours, roundTrip = 0.85, impact = 0.0, maxC
   V[0] = 0.0;
   const n = prices.length;
   for (let t = 0; t < n; t++) {
-    const p = prices[t], buy = p / s + impact / (s * s), sell = p * s - impact * (s * s);
+    const p = prices[t], buy = (p + fee) / s + impact / (s * s), sell = p * s - impact * (s * s);
     // only states that can be reached by now and still end empty (the rest can't change the answer)
     const socTop = Math.min(E, t, n - t), disTop = Math.min(cap, t >> 1);
     W.set(V.subarray(0, size));                               // idle
@@ -78,9 +80,9 @@ export function batteryCurve(prices, hours, roundTrip = 0.85, impact = 0.0, maxC
 }
 
 // The best day with at most `cycles` full cycles: [EUR, MWh discharged]; never below zero (idle).
-export function batteryDp(prices, hours, roundTrip = 0.85, cycles = 1, impact = 0.0) {
+export function batteryDp(prices, hours, roundTrip = 0.85, cycles = 1, impact = 0.0, fee = 0.0) {
   let best = 0.0, used = 0;
-  batteryCurve(prices, hours, roundTrip, impact, cycles).forEach((v, q) => { if (v > best + 1e-12) { best = v; used = q; } });
+  batteryCurve(prices, hours, roundTrip, impact, cycles, fee).forEach((v, q) => { if (v > best + 1e-12) { best = v; used = q; } });
   return [best, used];
 }
 
@@ -485,28 +487,31 @@ export function tollPlan(cv, docs, years, { start, months, today }) {
 // The slow part of a toll, which only the curve, the history, the tenor and the battery change: per
 // month, the intrinsic value and each scenario's, in EUR per MW. `cycles` is the contract's average a
 // day over each contract year (at most DAILY_MAX in a day); `mw` the project's power and `impact` the
-// price move per GW of it as a share of the month's base price. With `free` the months also carry the
-// same battery as a price-taker (the bridge's own-impact step); `options` adds each cycle limit. `plan`
-// (from tollPlan, for the same curve, history and tenor) saves building it again.
+// price move per GW of it as a share of the month's base price; `fee` the grid's charge per MWh drawn
+// to charge. With `free` the months also carry the same battery as a price-taker without the fee and
+// with it (the bridge's fee and own-impact steps); `options` adds each cycle limit. `plan` (from
+// tollPlan, for the same curve, history and tenor) saves building it again.
 export function tollMonths(cv, docs, years, { start, months, hours = 2, round_trip = 0.85, cycles = 1.0, today, mw = 0.0, impact = 0.0,
-  options = CYCLE_OPTIONS, free = true, plan: given = null }) {
+  fee = 0.0, options = CYCLE_OPTIONS, free = true, plan: given = null }) {
   const P = given || tollPlan(cv, docs, years, { start, months, today });
   const { tenor, days: plan, ys, yRef } = P;
   const sized = mw > 0 && impact > 0;
   const cache = new Map();
   // Map "contract year|curve or history year" -> { src, items: steps best first, days }; `own`: with the
-  // project's impact. The slow part: kept with the plan, so other cycle limits come free.
-  const ranked = (own) => {
-    const key = `${hours}|${round_trip}|${own && sized ? `${mw}|${impact}` : "taker"}`;
+  // project's impact; `fees`: paying the grid fee. The slow part: kept with the plan, so other cycle
+  // limits come free.
+  const ranked = (own, fees = true) => {
+    const f = fees ? fee : 0.0;
+    const key = `${hours}|${round_trip}|${own && sized ? `${mw}|${impact}` : "taker"}|${f}`;
     if (!poolCache.has(P)) poolCache.set(P, new Map());
     const memo = poolCache.get(P);
     if (memo.has(key)) { const hit = memo.get(key); memo.delete(key); memo.set(key, hit); return hit; }
-    const pools = rankPools(own);
+    const pools = rankPools(own, f);
     memo.set(key, pools);
     if (memo.size > POOLS_KEPT) memo.delete(memo.keys().next().value);
     return pools;
   };
-  const rankPools = (own) => {
+  const rankPools = (own, f) => {
     const pools = new Map();
     plan.forEach(([cdays, ndays, scen], k) => {
       const mo = tenor[k], d = own && sized ? impact * Math.max(mo.base, 0.0) * mw / 1000.0 : 0.0, c = Math.floor(k / 12);
@@ -514,8 +519,8 @@ export function tollMonths(cv, docs, years, { start, months, hours = 2, round_tr
       if (!pools.has(ck)) pools.set(ck, { c, src: "curve", items: [], days: 0 });
       const pc = pools.get(ck);
       for (const [p, cnt, pk] of cdays) {
-        const key = `${pk}|${d}`;
-        if (!cache.has(key)) cache.set(key, daySteps(batteryCurve(p, hours, round_trip, d)));
+        const key = `${pk}|${d}|${f}`;
+        if (!cache.has(key)) cache.set(key, daySteps(batteryCurve(p, hours, round_trip, d, DAILY_MAX, f)));
         for (const [q, v] of cache.get(key)) pc.items.push([v / q, q * cnt, v * cnt, k]);
       }
       pc.days += ndays;
@@ -523,7 +528,7 @@ export function tollMonths(cv, docs, years, { start, months, hours = 2, round_tr
         const yk = `${c}|${y}`;
         if (!pools.has(yk)) pools.set(yk, { c, src: y, items: [], days: 0 });
         const py = pools.get(yk);
-        for (const [p, w] of ds) for (const [q, v] of daySteps(batteryCurve(p, hours, round_trip, d))) py.items.push([v / q, q * w, v * w, k]);
+        for (const [p, w] of ds) for (const [q, v] of daySteps(batteryCurve(p, hours, round_trip, d, DAILY_MAX, f))) py.items.push([v / q, q * w, v * w, k]);
         py.days += covered;
       }
     });
@@ -554,11 +559,14 @@ export function tollMonths(cv, docs, years, { start, months, hours = 2, round_tr
   };
   const at = ranked(true);
   const [main, shadow, used] = values(at, cycles);
+  // the bridge's starting points: a price-taker paying the fee, and one without it
   const taker = sized && free ? values(ranked(false), cycles)[0] : main;
+  const bare = fee && free ? values(ranked(false, false), cycles)[0] : taker;
   const opts = options.map((c) => values(at, c));
   const rows = main.map((r, k) => ({ month: tenor[k].month, k, year: ymd(tenor[k].month).y, ...r,
-    free: { intrinsic: taker[k].intrinsic, spot: taker[k].spot }, options: opts.map((o) => [o[0][k].intrinsic, o[0][k].spot]) }));
-  return { start, months, hours, cycles, mw, impact, rows, ys, yRef, shadow, cyclesPerDay: used,
+    free: { intrinsic: bare[k].intrinsic, spot: bare[k].spot }, taker: { intrinsic: taker[k].intrinsic, spot: taker[k].spot },
+    options: opts.map((o) => [o[0][k].intrinsic, o[0][k].spot]) }));
+  return { start, months, hours, cycles, mw, impact, fee, rows, ys, yRef, shadow, cyclesPerDay: used,
     options: options.map((c, j) => ({ cycles: c, cycles_per_day: opts[j][2] })) };
 }
 
@@ -573,6 +581,8 @@ export function tollValue(tm, { availability = 0.97, degradation = 0.02, realism
   const real = (i, s) => i + realism * (s - i);
   const a0 = lev(rows.map((r) => r.free.intrinsic)), a1 = lev(rows.map((r) => r.free.spot));
   const a2 = a0 + realism * (a1 - a0);
+  const f0 = lev(rows.map((r) => r.taker.intrinsic)), f1 = lev(rows.map((r) => r.taker.spot));   // paying the grid fee
+  const f2 = f0 + realism * (f1 - f0);
   const b0 = lev(rows.map((r) => r.intrinsic)), b1 = lev(rows.map((r) => r.spot));   // the project's own size
   const b2 = b0 + realism * (b1 - b0), a3 = availability * b2;
   const a4 = lev(rows.map((r) => real(r.intrinsic, r.spot) * availability * (1 - degradation) ** Math.floor(r.k / 12)));
@@ -582,7 +592,8 @@ export function tollValue(tm, { availability = 0.97, degradation = 0.02, realism
     { key: "intrinsic", label: "Intrinsic: the curve's daily shape", value: a0, total: true },
     { key: "extrinsic", label: "Extrinsic: history's daily swings", value: a1 - a0 },
     { key: "realism", label: "Extrinsic you won't capture", value: a2 - a1 },
-    { key: "impact", label: "Own price impact", value: b2 - a2 },
+    { key: "fee", label: "Grid fee on charging", value: f2 - a2 },
+    { key: "impact", label: "Own price impact", value: b2 - f2 },
     { key: "availability", label: "Availability", value: a3 - b2 },
     { key: "degradation", label: "Degradation", value: a4 - a3 },
     { key: "trend", label: "Trend in daily spreads", value: a5 - a4 },
@@ -608,7 +619,7 @@ export function tollValue(tm, { availability = 0.97, degradation = 0.02, realism
   });
   const missing = rows.filter((r) => !r.scen.size).length;
   const notes = missing ? [`${missing} of ${rows.length} months have no complete history days in the chosen years: they use the intrinsic value.`] : [];
-  return { start: tm.start, months, steps, offer: a8, value: a6, spot: a1, intrinsic: a0, cycles: tm.cycles, mw: tm.mw, shadow: tm.shadow,
+  return { start: tm.start, months, steps, offer: a8, value: a6, spot: a1, intrinsic: a0, cycles: tm.cycles, mw: tm.mw, fee: tm.fee ?? 0, shadow: tm.shadow,
     cycles_per_day: tm.cyclesPerDay, years: yearsOut, scenarios, by_cycles: byCycles, y_ref: yRef, notes };
 }
 

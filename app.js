@@ -7,7 +7,7 @@ import * as rfq from "./rfq.js";
 import * as idm from "./intraday.js";
 import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, dayNum, weekday, baseHours, isHoliday, zonedToUtc, parse, MONTH_ABBR } from "./calendar.js";
 
-const VERSION = "0.7.0";
+const VERSION = "0.8.0";
 const STORE = "powerapp.v1";
 const DATA_CACHE = "pa-data-v1";
 const DEFAULT_BRANCH = "dashboard-data";
@@ -1003,10 +1003,13 @@ function curveHistory(stats, zone) {
 // Price a deal against the Curve tab's curve: a pay-as-produced solar or wind PPA, or a battery toll.
 const YIELD_SOLAR = { DE: 1000, FR: 1150, NL: 950, BE: 950, AT: 1050, CH: 1050, PL: 1000, CZ: 1050, SK: 1150, HU: 1250, SI: 1150, "IT-N": 1300, ES: 1700 };
 const YIELD_WIND = 2200;
+// € per MWh drawn from the grid to charge, in zones whose grid charges storage for it; anywhere else
+// nothing until you type a figure. Shared by the RfQ and Intraday tabs.
+const GRID_FEE = { HU: 14.13 };
 const RFQ_DEFAULTS = {
   deal: "solar", start: "", ppaYears: "10", tollYears: "7", growth: "2", discount: "5",
   ppaMw: "50", yields: {}, pvDeg: "0.5", windDeg: "0", neg: "paid", trend: "0", balSolar: "2", balWind: "3", ppaRisk: "1.5", ppaMargin: "1",
-  bessMw: "50", bh: "2", cycles: "1", impactPct: "", rt: "85", avail: "97", bessDeg: "2", realism: "70", other: "0", strend: "0", tollRisk: "10", tollMargin: "5",
+  bessMw: "50", bh: "2", cycles: "1", impactPct: "", rt: "85", fees: {}, avail: "97", bessDeg: "2", realism: "70", other: "0", strend: "0", tollRisk: "10", tollMargin: "5",
   structure: "toll", floorPct: "70", volYear: "25", volDrift: "10", capPct: "100", floorMargin: "15",
 };
 const rfqCfg = () => ({ ...RFQ_DEFAULTS, ...(cfg.rfq || {}) });
@@ -1018,6 +1021,12 @@ const saveRfq = (patch) => saveCfg({ rfq: { ...rfqCfg(), ...patch } });
 const defaultRfqStart = (today) => `Cal${String((ymd(today).y + 1) % 100).padStart(2, "0")}`;
 const numOr = (x, dflt) => { const v = dec(x); return isFinite(v) ? v : dflt; };
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const gridFee = (zone) => clamp(numOr((rfqCfg().fees || {})[zone], GRID_FEE[zone] ?? 0), 0, 1000);
+// The zone's grid fee as a form field (one figure per zone, the same on both tabs).
+const gridFeeField = (zone, onChange, hint) => h("label", { class: "field" }, h("span", { text: "Grid fee on charging, €/MWh" }),
+  h("input", { class: "input", type: "text", inputmode: "decimal", value: (rfqCfg().fees || {})[zone] ?? String(GRID_FEE[zone] ?? 0),
+    autocomplete: "off", spellcheck: "false", oninput: (e) => { saveRfq({ fees: { ...(rfqCfg().fees || {}), [zone]: e.target.value } }); onChange(); } }),
+  h("small", { class: "hint", text: hint }));
 
 const rfqDocs = {};   // "ZONE-YEAR" -> long-history document | "loading" | { error }
 async function loadDoc(zone, year) {
@@ -1122,7 +1131,7 @@ function viewRfq() {
       h("div", { class: "form-grid even" },
         startField, field("Years", "tollYears"), field("Power, MW", "bessMw"),
         field("Price impact, % per GW", "impactPct", { ph: imp ? imp.pc(imp.per_gw) : "0", hint: imp ? imp.hint : "no estimate for this zone yet" }),
-        field("Round trip, %", "rt"), field("Availability, %", "avail"),
+        field("Round trip, %", "rt"), gridFeeField(zone, later, `each MWh ${zone}'s grid delivers to charge`), field("Availability, %", "avail"),
         field("Degradation, % a year", "bessDeg"), field("Extrinsic captured, %", "realism", { hint: "trading never sees tomorrow" }),
         field("Other revenue, €/MW a year", "other", { hint: "ancillary, intraday: your own figure" }), field("Spread trend, % a year", "strend", { hint: "everyone else's batteries flattening days" }),
         ...(floorOn ? [
@@ -1190,17 +1199,18 @@ function viewRfq() {
         const mw = clamp(numOr(c.bessMw, 50), 0, 100000), imp = impactInfo(stats, zone);
         const typed = dec(c.impactPct), own = String(c.impactPct ?? "").trim() !== "" && isFinite(typed);
         const impact = own ? clamp(typed / 100, 0, 10) : imp ? imp.per_gw : 0;
+        const fee = gridFee(zone);
         const planKey = `${curveKey}|${docKey}`;
         if (rfqMemo.planKey !== planKey) { rfqMemo.plan = rfq.tollPlan(cv, docs, years, { start, months, today }); rfqMemo.planKey = planKey; rfqMemo.sizesKey = null; }
-        const battery = { start, months, hours, round_trip: rt, cycles, today, impact, plan: rfqMemo.plan };
-        const key = `${planKey}|toll|${hours}|${cycles}|${rt}|${mw}|${impact}`;
+        const battery = { start, months, hours, round_trip: rt, cycles, today, impact, fee, plan: rfqMemo.plan };
+        const key = `${planKey}|toll|${hours}|${cycles}|${rt}|${mw}|${impact}|${fee}`;
         if (rfqMemo.monthsKey !== key) { rfqMemo.months = rfq.tollMonths(cv, docs, years, { ...battery, mw }); rfqMemo.monthsKey = key; }
         const terms = { availability: clamp(numOr(c.avail, 97) / 100, 0, 1), degradation: clamp(numOr(c.bessDeg, 2) / 100, 0, 0.5),
           realism: clamp(numOr(c.realism, 70) / 100, 0, 1), other: numOr(c.other, 0), trend: numOr(c.strend, 0) / 100, discount, today };
         // the curve's average base price over the tenor: what the impact's share of the price is a share of
         const end = rfq.addMonths(start, months), inTenor = cv.months.filter((m) => m.month >= start && m.month < end);
         const level = total(inTenor.map((m) => m.base * m.hours.base)) / total(inTenor.map((m) => m.hours.base));
-        const size = { mw, hours, cycles, impact, imp, own, level, zone, assumed, cv, stats };
+        const size = { mw, hours, cycles, impact, imp, own, level, zone, assumed, cv, stats, fee, rt };
         if (c.structure === "floor") {
           const f = rfq.floorValue(rfqMemo.months, { ...terms, floor: clamp(numOr(c.floorPct, 70) / 100, 0, 2),
             vol_year: clamp(numOr(c.volYear, 25) / 100, 0, 3), vol_drift: clamp(numOr(c.volDrift, 10) / 100, 0, 3),
@@ -1296,6 +1306,12 @@ function impactNote({ mw, impact, imp, own, level, zone }, cost) {
   return h("p", { class: "note", text: `Size: a battery's own trades move the price against it. Discharging adds supply, charging adds demand. A GW moves ${zone}'s price by ${pc(impact)}% (${where}), so at full power ${upTo2.format(mw)} MW sells about ${p2(move)} €/MWh lower and buys that much higher, at this curve's ${p2(level)} €/MWh. That costs ${eur(-cost)} per MW a year here.${split}` });
 }
 
+// The grid fee on charging, in words: what it does to a cycle, and what it costs after the battery adapts.
+function feeNote({ fee, zone, rt }, cost) {
+  if (!(fee > 0)) return null;
+  return h("p", { class: "note", text: `Grid fee: every MWh ${zone}'s grid delivers to charge the battery costs ${p2(fee)} €/MWh on top of its price, so a cycle only pays if it sells ${p2(fee / rt)} €/MWh dearer than it would have to without the fee (at ${pct(rt, 0)} round trip). The battery drops the spreads that no longer pay; what's left costs ${eur(-cost)} per MW a year here.` });
+}
+
 function cyclesNote(r, hours) {
   const used = r.cycles_per_day, binding = r.shadow > 1e-9;
   return h("p", { class: "note", text: `Cycles: ${upTo2.format(r.cycles)} a day on average over each contract year, at most two in any one day. The battery spends them where they earn most, cycling twice on a volatile day and resting on a flat one. Here it uses ${used != null ? p2(used) : "—"} a day` +
@@ -1303,9 +1319,11 @@ function cyclesNote(r, hours) {
 }
 
 function tollResult(r, size) {
-  const { mw, hours, cycles, assumed, cv, stats } = size;
-  const steps = r.steps.map((s) => (s.key === "impact" ? { ...s, label: `Own price impact, ${upTo2.format(mw)} MW` } : s));
-  const cost = r.steps.find((s) => s.key === "impact").value;
+  const { mw, hours, cycles, assumed, cv, stats, fee } = size;
+  const steps = r.steps.filter((s) => s.key !== "fee" || fee > 0)
+    .map((s) => (s.key === "impact" ? { ...s, label: `Own price impact, ${upTo2.format(mw)} MW` }
+      : s.key === "fee" ? { ...s, label: `Grid fee on charging, ${p2(fee)} €/MWh` } : s));
+  const cost = r.steps.find((s) => s.key === "impact").value, feeCost = r.steps.find((s) => s.key === "fee").value;
   const box = h("div", { class: "chart-box" }), sizeBox = h("div", { class: "chart-box" });
   waterfallChart(box, { steps, fmt: eur, unit: "€ per MW a year", label: "From intrinsic value to the toll offer" });
   const janStart = ymd(r.start).m === 1;
@@ -1324,7 +1342,8 @@ function tollResult(r, size) {
         stat("Intrinsic share", pct(r.intrinsic / r.spot, 0), "of perfect foresight"),
         stat("Cycles a day", r.cycles_per_day != null ? p2(r.cycles_per_day) : "—", `of ${upTo2.format(cycles)} allowed`)),
       h("h2", { class: "h2", text: "From intrinsic value to offer" }), box,
-      h("p", { class: "note", text: `Intrinsic: a ${hours}-hour battery dispatched on the curve's average days. Forwards can lock much of it in today. Extrinsic: the same battery on each history year's real days, rescaled to your curve, knowing every day's prices in advance; real days swing around the average, so it earns more, but trading only captures part of it. Both start as a battery too small to move the price.` }),
+      h("p", { class: "note", text: `Intrinsic: a ${hours}-hour battery dispatched on the curve's average days. Forwards can lock much of it in today. Extrinsic: the same battery on each history year's real days, rescaled to your curve, knowing every day's prices in advance; real days swing around the average, so it earns more, but trading only captures part of it. Both start as a battery too small to move the price${fee > 0 ? ", paying no grid fee" : ""}.` }),
+      feeNote(size, feeCost),
       impactNote(size, cost),
       cyclesNote(r, hours),
       h("p", { class: "note", text: "Day-ahead only, in whole hours, each day starting and ending empty. Intraday trading, 15-minute products and balancing services aren't modelled: put your own figure under Other revenue." }),
@@ -1387,7 +1406,7 @@ function growSizes(box, { cv, docs, years, battery, valueTerms, chosen, key }) {
 
 // A revenue floor: one put a year on the battery's revenue. Returns the nodes and a draw() for the chart,
 // which needs to be in the page to measure its width.
-function floorResult(f, { mw, hours, cycles, impact, margin, assumed, cv, zone }) {
+function floorResult(f, { mw, hours, cycles, impact, fee, margin, assumed, cv, zone }) {
   const E = f.expected, F = f.level, C = f.cap_level;
   const shareOk = f.share != null && f.share <= 1;
   const janStart = ymd(f.start).m === 1;
@@ -1409,7 +1428,7 @@ function floorResult(f, { mw, hours, cycles, impact, margin, assumed, cv, zone }
       h("h2", { class: "h2", text: "What the floor pays you, net" }), box,
       h("p", { class: "note", text: `A floor at ${eur(F)}: after any year whose revenue R ends below it, the provider pays the difference, max(F − R, 0). That's a put on R struck at F, one for every year of the contract: the hockey stick above, shifted down by what it costs. You keep R, so you end the year with max(R, F), like holding a stock with a put on it. The battery itself holds a call on every day's spread, so the floor is a put on a basket of calls: it pays out in calm years, when days are flat, gas is cheap or many batteries share the spreads.` }),
       h("p", { class: "note", text: "Each year's revenue is lognormal around what's expected of it. Its uncertainty has two parts: the year's own surprise, which doesn't depend on how far away the year is, and a drift in the level that grows with time and, since revenue is earned through the year, counts like an average: σ² + σ_drift²·(t + T/3). Each year is then a Black-76 put, as on the Options tab." }),
-      h("p", { class: "note", text: `Expected revenue is the toll's for ${upTo2.format(cycles)} cycle${cycles === 1 ? "" : "s"} a day on average${impact > 0 && mw > 0 ? `, for a ${upTo2.format(mw)} MW battery whose own trades move ${zone}'s price (see the Toll view for what that costs)` : ""}.` }),
+      h("p", { class: "note", text: `Expected revenue is the toll's for ${upTo2.format(cycles)} cycle${cycles === 1 ? "" : "s"} a day on average${impact > 0 && mw > 0 ? `, for a ${upTo2.format(mw)} MW battery whose own trades move ${zone}'s price (see the Toll view for what that costs)` : ""}${fee > 0 ? `, after ${zone}'s grid fee of ${p2(fee)} €/MWh on charging` : ""}.` }),
       h("p", { class: "note", text: shareOk
         ? `Instead of a fee you can give the provider ${pct(f.share, 1)} of revenue above ${eur(C)}: that's selling it a call. Floor plus share is a collar, and it costs nothing upfront when share × Call(threshold) = Put(floor).`
         : "Instead of a fee you could give the provider a share of revenue above the threshold: that's selling it a call, and floor plus share is a collar. Here the calls above the threshold are worth less than the puts, so no share would cover it: lower the threshold or the floor." }),
@@ -1661,7 +1680,7 @@ function spreadSection() {
 // PowerDesk's intraday.py). The day-ahead day comes from the Curve tab's curve or is made up; all of
 // intraday is a toy, on purpose.
 const ID_DEFAULTS = { day: "curve", month: "", dt: "0", bh: "2", cycles: "2", rt: "85", sigma: "8", phi: "80", perDay: "1.5",
-  size: "100", length: "2", shape: "80", cost: "2", days: "500" };
+  size: "100", length: "2", shape: "80", cost: "0.25", days: "500" };
 const idCfg = () => ({ ...ID_DEFAULTS, ...(cfg.intraday || {}) });
 const saveId = (patch) => saveCfg({ intraday: { ...idCfg(), ...patch } });
 const MADE_UP_DAY = [92, 86, 82, 81, 84, 93, 110, 112, 95, 70, 48, 38, 33, 30, 33, 45, 62, 88, 112, 140, 180, 150, 118, 104];
@@ -1743,7 +1762,8 @@ function viewIntraday() {
       field("Spike size, €/MWh", "size", { hint: "on average" }),
       field("Spike length, hours", "length", { hint: "on average" }),
       field("Spikes going the day's way, %", "shape", { hint: "up at the peak, down at noon" }),
-      field("Trading cost, €/MWh", "cost", { hint: "bid-ask and fees, each MWh traded" }),
+      field("Trading cost, €/MWh", "cost", { hint: "fees and the spread you cross, each MWh traded" }),
+      gridFeeField(zone, later, `${zone}'s, shared with the RfQ tab`),
       field("Round trip, %", "rt"),
       field("Days simulated", "days")));
 
@@ -1751,8 +1771,9 @@ function viewIntraday() {
     const c = idCfg();
     const opts = { sigma: clamp(numOr(c.sigma, 8), 0, 500), phi: clamp(numOr(c.phi, 80) / 100, 0, 0.98), perDay: clamp(numOr(c.perDay, 1.5), 0, 24),
       size: clamp(numOr(c.size, 100), 0, 5000), length: clamp(numOr(c.length, 2), 1, 48), shape: clamp(numOr(c.shape, 80) / 100, 0, 1),
-      cost: clamp(numOr(c.cost, 2), 0, 1000) };
-    const bat = { hours: [1, 2, 4].includes(+c.bh) ? +c.bh : 2, roundTrip: clamp(numOr(c.rt, 85) / 100, 0.5, 1), cycles: c.cycles === "1" ? 1 : 2 };
+      cost: clamp(numOr(c.cost, 0.25), 0, 1000) };
+    const bat = { hours: [1, 2, 4].includes(+c.bh) ? +c.bh : 2, roundTrip: clamp(numOr(c.rt, 85) / 100, 0.5, 1), cycles: c.cycles === "1" ? 1 : 2,
+      fee: gridFee(zone) };
     return { opts, bat, days: Math.round(clamp(numOr(c.days, 500), 50, 5000)) };
   }
 
@@ -1796,7 +1817,7 @@ function viewIntraday() {
       h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: "As spikes get more frequent" }), sweepBox),
       h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: "How the toy works" }),
         h("p", { class: "note", text: "Each hour's final intraday price is its day-ahead price plus a drift that carries on from hour to hour (forecasts going wrong) and spikes, which mostly go the way of the day: up in its dear half, down in its cheap half. Before an hour closes, the market quotes it at its expected final price, and on average intraday equals day-ahead, so whatever a way of trading earns beyond day-ahead comes from using what it learns, not from a bias." }),
-        h("p", { class: "note", text: "All four sell the day-ahead schedule in the auction. Every MWh traded in intraday after that costs the trading cost. The rolling LP plans the rest of the day every hour on the quotes and trades the plan at once, changing it only when the new plan beats the old by more than the trades cost. The patient trader waits and trades each hour at its close, choosing by a dynamic programme that knows how the world moves: it holds energy and headroom while the chance of a better price later is worth more than the spread on offer now." }),
+        h("p", { class: "note", text: `All four sell the day-ahead schedule in the auction. Every MWh traded in intraday after that costs the trading cost${bat.fee > 0 ? `, and every MWh each ends up charging pays ${zone}'s grid fee, ${p2(bat.fee)} €/MWh, however it was bought` : ""}. The rolling LP plans the rest of the day every hour on the quotes and trades the plan at once, changing it only when the new plan beats the old by more than the trades cost. The patient trader waits and trades each hour at its close, choosing by a dynamic programme that knows how the world moves: it holds energy and headroom while the chance of a better price later is worth more than the spread on offer now.` }),
         h("p", { class: "note", text: "With free trading the rolling LP gets nearly what the patient trader gets: committing early only costs what changing its mind costs, and that's nothing. Make trading cost something, or spikes common, and the gap opens. Most of the oracle's lead is hindsight." }),
         h("p", { class: "note", text: "A toy: one day, whole hours, whole MWh, as much liquidity as it wants at the quoted price, and the same seeded draw of days every time." })));
     requestAnimationFrame(() => {

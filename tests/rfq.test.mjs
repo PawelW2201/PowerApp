@@ -46,7 +46,7 @@ for (const cs of fx.cases) {
         for (const k of ["months", "intrinsic", "spot", "spot_min", "spot_max", "net"]) close(y[k], e.years[i][k], `year ${e.years[i].from} ${k}`);
       });
       // the same battery under a revenue floor
-      const tech = { hours: o.hours, round_trip: o.round_trip, cycles: o.cycles, mw: o.mw, impact: o.impact };
+      const tech = { hours: o.hours, round_trip: o.round_trip, cycles: o.cycles, mw: o.mw, impact: o.impact, fee: o.fee };
       Object.keys(tech).forEach((k) => tech[k] === undefined && delete tech[k]);
       const tm = tollMonths(cv, docs, fx.years, { start, months: cs.months, today, ...tech });
       for (const fl of cs.floors) {
@@ -64,11 +64,11 @@ for (const cs of fx.cases) {
 
 test("battery dispatch, revenue by MWh and its steps", () => {
   for (const b of fx.battery) {
-    const where = `battery ${b.hours}h x${b.cycles} impact ${b.impact}`;
-    const [v, used] = batteryDp(b.prices, b.hours, 0.85, b.cycles, b.impact);
+    const where = `battery ${b.hours}h x${b.cycles} impact ${b.impact} fee ${b.fee}`;
+    const [v, used] = batteryDp(b.prices, b.hours, 0.85, b.cycles, b.impact, b.fee);
     close(v, b.out[0], where, 1e-12);
     assert.equal(used, b.out[1]);
-    const c = batteryCurve(b.prices, b.hours, 0.85, b.impact);
+    const c = batteryCurve(b.prices, b.hours, 0.85, b.impact, undefined, b.fee);
     assert.equal(c.length, b.curve.length);
     c.forEach((x, q) => (b.curve[q] == null ? assert.equal(x, -Infinity) : close(x, b.curve[q], `${where} q=${q}`, 1e-12)));
     const st = daySteps(c);
@@ -77,13 +77,35 @@ test("battery dispatch, revenue by MWh and its steps", () => {
   }
 });
 
-test("the toll as the battery grows", () => {
-  const a = fx.sizes.args, start = parseIso(a.start);
-  const { cv } = tenorCurve(fx.quotes, "DE", fx.stats, fx.years, "multiplicative", start, a.months, 0.0);
-  const r = tollSizes(cv, docs, fx.years, { ...a, start, today });
-  assert.equal(r.length, fx.sizes.result.length);
-  r.forEach((x, i) => { assert.equal(x.mw, fx.sizes.result[i].mw); close(x.value, fx.sizes.result[i].value, `value ${x.mw}`); close(x.offer, fx.sizes.result[i].offer, `offer ${x.mw}`); });
-  for (let i = 1; i < r.length; i++) assert.ok(r[i].offer < r[i - 1].offer, "a bigger battery earns less per MW");
+test("the toll as the battery grows, with and without a grid fee", () => {
+  const offers = fx.sizes.map((sz) => {
+    const a = sz.args, start = parseIso(a.start);
+    const { cv } = tenorCurve(fx.quotes, "DE", fx.stats, fx.years, "multiplicative", start, a.months, 0.0);
+    const r = tollSizes(cv, docs, fx.years, { ...a, start, today });
+    assert.equal(r.length, sz.result.length);
+    r.forEach((x, i) => { assert.equal(x.mw, sz.result[i].mw); close(x.value, sz.result[i].value, `value ${x.mw}`); close(x.offer, sz.result[i].offer, `offer ${x.mw}`); });
+    for (let i = 1; i < r.length; i++) assert.ok(r[i].offer < r[i - 1].offer, "a bigger battery earns less per MW");
+    return r.map((x) => x.offer);
+  });
+  offers[1].forEach((o, i) => assert.ok(o < offers[0][i], "the fee costs something at every size"));
+});
+
+test("the grid fee's bridge step", () => {
+  const cs = fx.cases.find((c) => c.name.includes("a grid fee on charging"));
+  const start = parseIso(cs.start);
+  const { cv } = tenorCurve(fx.quotes, "DE", fx.stats, fx.years, cs.mode, start, cs.months, cs.growth);
+  const o = { ...cs.args, start, months: cs.months, today };
+  const withFee = toll(cv, docs, fx.years, o), without = toll(cv, docs, fx.years, { ...o, fee: 0 });
+  const step = (r, k) => r.steps.find((s) => s.key === k).value;
+  assert.ok(step(withFee, "fee") < 0);
+  assert.equal(step(without, "fee"), 0);
+  assert.equal(withFee.intrinsic, without.intrinsic);              // the bridge starts without it
+  assert.equal(withFee.spot, without.spot);
+  // after the fee, everything is as if the battery had been worth that much less from the start
+  close(step(withFee, "realism"), step(without, "realism"), "realism");
+  assert.ok(step(withFee, "availability") > step(without, "availability"));   // a smaller loss on a smaller value
+  assert.ok(withFee.offer < without.offer);
+  assert.ok(withFee.cycles_per_day <= without.cycles_per_day + 1e-9, "it drops the thinnest spreads");
 });
 
 test("history by month, with local hours", () => {
