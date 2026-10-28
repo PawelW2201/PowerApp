@@ -6,7 +6,7 @@ import * as crv from "./curve.js";
 import * as rfq from "./rfq.js";
 import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, dayNum, weekday, baseHours, isHoliday, zonedToUtc, parse, MONTH_ABBR } from "./calendar.js";
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const STORE = "powerapp.v1";
 const DATA_CACHE = "pa-data-v1";
 const DEFAULT_BRANCH = "dashboard-data";
