@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { tenorCurve, ppa, toll, tollMonths, tollSizes, floorValue, batteryDp, batteryCurve, daySteps, historyMonths } from "../rfq.js";
+import { tenorCurve, ppa, toll, tollMonths, tollSizes, floorValue, batteryDp, batteryCurve, daySteps, historyMonths, anchor, anchorValue, anchorTm } from "../rfq.js";
 import { parseIso, isoDate } from "../calendar.js";
 
 const fx = JSON.parse(readFileSync(new URL("./rfq-fixture.json", import.meta.url)));
@@ -115,3 +115,34 @@ test("history by month, with local hours", () => {
   assert.deepEqual(hm.days.map((d) => d.daytype), fx.history.daytypes);
   assert.deepEqual(hm.days[0].gen.slice(0, 24), fx.history.gen0);
 });
+
+// priced off a figure of your own: the same numbers as PowerDesk's, case by case
+const stats26 = { ...fx.stats, years: { ...fx.stats.years, 2026: { ...fx.stats.years["2025"], monthly: Object.fromEntries(
+  Object.entries(fx.stats.years["2025"].monthly).map(([k, v]) => [k, [...v.slice(0, 10), null, null]])) } } };
+for (const ac of fx.anchors) {
+  test(`your own figure: ${ac.name}`, () => {
+    const a = ac.args, start = parseIso(a.start), st = ac.stats === "base" ? fx.stats : stats26;
+    const { cv } = tenorCurve(ac.quotes, "DE", st, fx.years, "multiplicative", start, a.months, a.growth);
+    const am = anchor(cv, st, fx.years, "multiplicative", { start, months: a.months, revenue: 150000, year: a.year, index: a.index,
+      hours: a.hours, round_trip: a.round_trip, cycles: a.cycles, fee: a.fee, today });
+    close(am.ref, ac.anchor.ref, "reference");
+    assert.deepEqual(am.ref_months.map(([m, s]) => [isoDate(m), s]), ac.anchor.ref_months);
+    assert.deepEqual(Object.keys(am.by_year), Object.keys(ac.anchor.by_year));
+    for (const [y, b] of Object.entries(ac.anchor.by_year)) { close(am.by_year[y].index, b.index, `index ${y}`); close(am.by_year[y].value, b.value, `value ${y}`); }
+    assert.equal(am.rows.length, ac.bases.length);
+    am.rows.forEach((r, i) => close(r.base, ac.bases[i], `month ${i}`));
+    const v = anchorValue(am, { cannibal: a.cannibal, cap: a.cap, risk: 0.12, margin: 0.04, today, ...ac.terms }), e = ac.value;
+    assert.deepEqual(v.steps.map((s) => [s.key, s.label, !!s.total]), e.steps.map((s) => [s.key, s.label, !!s.total]));
+    v.steps.forEach((s, i) => close(s.value, e.steps[i].value, `step ${s.key}`));
+    close(v.offer, e.offer, "offer"); close(v.value, e.value, "value");
+    assert.equal(v.years.length, e.years.length);
+    v.years.forEach((y, i) => { assert.equal(isoDate(y.from), e.years[i].from); for (const k of ["months", "index", "cannibal", "curve", "own", "expected"]) close(y[k], e.years[i][k], `year ${i} ${k}`); });
+    assert.equal(v.calendar.length, e.calendar.length);
+    v.calendar.forEach((c, i) => { for (const k of ["year", "index", "curve", "own"]) close(c[k], e.calendar[i][k], `calendar ${c.year} ${k}`); });
+    v.by_rate.forEach((b, i) => { for (const k of ["rate", "value", "offer"]) close(b[k], e.by_rate[i][k], `rate ${b.rate} ${k}`); });
+    const f = floorValue(anchorTm(am, { cannibal: a.cannibal, cap: a.cap }), { floor: 0.7, vol_year: 0.3, vol_drift: 0.1, cap: 1.2, margin: 0.1,
+      realism: 1, other: 0, trend: 0, today, ...ac.terms });
+    for (const k of ["expected", "fair_fee", "fee", "chance"]) close(f[k], ac.floor[k], `floor ${k}`);
+    close(f.expected, v.value, "the floor prices the same revenue");
+  });
+}

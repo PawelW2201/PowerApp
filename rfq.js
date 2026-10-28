@@ -21,6 +21,8 @@
 // the steps up those revenue curves, best first (a Lagrangian; the last step is the shadow price).
 // Size: the battery's own trades move the price against it, by `impact` (a share of the month's
 // base price per GW of its power, estimated from history by PowerDesk) at its full power.
+// Your own figure: what you expect the battery to earn in one year, all in, moved to later years by the
+// curve and cut by your view of cannibalization (anchor, anchorValue); it's never stored here.
 // Revenue floor: the provider pays max(F - R, 0) after a year whose revenue R ends below F, a put
 // on R. R is lognormal around the toll's expected revenue with log variance vol_year^2 (a year's
 // own surprise) + vol_drift^2 (t_start + T/3) (the level's drift, earned through the year like an
@@ -630,6 +632,115 @@ export function tollSizes(cv, docs, years, o) {
     const v = tollValue(tollMonths(cv, docs, years, { ...o, mw, options: [], free: false, plan }), o);
     return { mw, value: v.value, offer: v.offer };
   });
+}
+
+// ------------------------------------------------------------------ a battery priced off your own figure
+// Public data can't see what a battery earns in intraday and balancing, so a toll can also start from
+// what you expect it to earn in one year, all in. Each later calendar year earns that times the curve's
+// index against the year (its average price, what its curve is worth to a battery on day-ahead with the
+// same shapes, or nothing), then your view of cannibalization takes its share. History gives the months
+// that have happened, the curve the rest.
+export const ANCHOR_INDEX = ["level", "spreads", "flat"];
+export const CANNIBAL_RATES = [0.0, 0.05, 0.10, 0.15, 0.20, 0.30];
+const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// What's left in calendar year y of the revenue the curve gives: down `rate` a year from `year`, at most `cap` in all.
+export const cannibalFactor = (y, year, rate, cap) => Math.max(1.0 - cap, (1.0 - rate) ** Math.max(y - year, 0));
+
+// The months of a calendar year with a price level: [month, base, peak, "history" | "curve"].
+export function yearMonths(cv, stats, year) {
+  const hist = stats && stats.years ? stats.years[String(year)] : null;
+  const by = new Map(cv.months.map((m) => [m.month, m]));
+  const out = [];
+  for (let mo = 1; mo <= 12; mo++) {
+    const m = dayNum(year, mo, 1), b = hist ? hist.monthly.base[mo - 1] : null;
+    if (b != null) out.push([m, b, hist.monthly.peak[mo - 1], "history"]);
+    else if (by.has(m)) out.push([m, by.get(m).base, by.get(m).peak, "curve"]);
+  }
+  return out;
+}
+function yearLevel(ym) {
+  let num = 0.0, den = 0.0;
+  for (const [m, b] of ym) { const h = (addMonths(m, 1) - m) * 24; num += b * h; den += h; }
+  return den ? num / den : null;
+}
+// What a battery earns on day-ahead per day, on a curve built from those months' base and peak with your shapes.
+function dayValue(cv, stats, years, mode, ym, hours, roundTrip, cycles, fee) {
+  if (!ym.length) return null;
+  const quotes = ym.map(([m, b, p]) => { const { y, m: mm } = ymd(m); return { product: `${MON[mm - 1]}${String(y % 100).padStart(2, "0")}`, base: b, peak: p ?? null }; });
+  const yc = build(quotes, cv.market.code, stats, years, mode), idx = monthIndex(yc);
+  let tot = 0.0, n = 0;
+  for (const [m] of ym) for (const [p, cnt] of curveDays(yc, idx.get(m) || [])) { tot += cnt * batteryDp(p, hours, roundTrip, cycles, 0.0, fee)[0]; n += cnt; }
+  return n ? tot / n : null;
+}
+
+// The tenor priced off your figure: `revenue` (EUR per MW, all in) earned in `year`, moved to each later
+// calendar year by the curve's index (`index`). Per month: the revenue before cannibalization,
+// availability and degradation (a twelfth of the year's).
+export function anchor(cv, stats, years, mode, { start, months, revenue, year, index = "level", hours = 2, round_trip = 0.85, cycles = 1.0, fee = 0.0, today }) {
+  check(cv, start, today);
+  if (!ANCHOR_INDEX.includes(index)) throw new Error(`index must be one of ${ANCHOR_INDEX.join(", ")}`);
+  const tenor = tenorMonths(cv, start, months);
+  const cal = [...new Set(tenor.map((mo) => ymd(mo.month).y))].sort((a, b) => a - b);
+  const refMonths = yearMonths(cv, stats, year);
+  if (index !== "flat" && !refMonths.length) throw new Error(`no prices for ${year}: neither history nor the curve has any month of it`);
+  const value = (ym) => (index === "level" ? yearLevel(ym) : dayValue(cv, stats, years, mode, ym, hours, round_trip, cycles, fee));
+  const ref = index === "flat" ? null : value(refMonths);
+  if (index !== "flat" && !(ref && ref > 0)) throw new Error(`${year}'s ${index === "level" ? "price level" : "day-ahead spreads"} came out at nothing: the curve can't scale from it`);
+  const byYear = {};
+  for (const y of cal) {
+    const v = index === "flat" ? null : y === year ? ref : value(yearMonths(cv, stats, y));
+    byYear[y] = { value: v, index: index === "flat" ? 1.0 : v / ref };
+  }
+  const rows = tenor.map((mo, k) => { const y = ymd(mo.month).y; return { month: mo.month, k, year: y, base: revenue * byYear[y].index / 12.0 }; });
+  return { start, months, revenue, year, index, ref, ref_months: refMonths.map(([m, , , src]) => [m, src]), by_year: byYear, rows };
+}
+
+// The toll in EUR per MW a year from `anchor`: your figure -> following the curve -> cannibalization ->
+// availability -> degradation -> risk -> margin, levelized like the toll; with the offer for each rate.
+export function anchorValue(am, { cannibal = 0.0, cap = 1.0, availability = 0.97, degradation = 0.02, risk = 0.1, margin = 0.05, discount = 0.0,
+  today, rates = CANNIBAL_RATES }) {
+  const { rows, year, revenue } = am;
+  const df = rows.map((r) => (1 + discount) ** -tau(r.month, today)), wdf = sum(df);
+  const lev = (xs) => 12 * sum(xs.map((x, i) => df[i] * x)) / wdf;
+  const deg = rows.map((r) => (1 - degradation) ** Math.floor(r.k / 12)), base = rows.map((r) => r.base);
+  const path = (rate) => rows.map((r) => r.base * cannibalFactor(r.year, year, rate, cap));
+  const net = (xs) => xs.map((x, i) => x * availability * deg[i]);
+  const own = path(cannibal);
+  const s1 = lev(base), s2 = lev(own), s3 = availability * s2, s4 = lev(net(own)), s5 = s4 * (1 - risk), s6 = s5 * (1 - margin);
+  const steps = [
+    { key: "figure", label: `Your ${year} figure`, value: revenue, total: true },
+    { key: "curve", label: "Following the forward curve", value: s1 - revenue },
+    { key: "cannibal", label: "Cannibalization (your view)", value: s2 - s1 },
+    { key: "availability", label: "Availability", value: s3 - s2 },
+    { key: "degradation", label: "Degradation", value: s4 - s3 },
+    { key: "risk", label: "Risk premium", value: s5 - s4 },
+    { key: "margin", label: "Margin", value: s6 - s5 },
+    { key: "offer", label: "Toll offer", value: s6, total: true },
+  ];
+  const yearsOut = [];
+  for (let k = 0; k < Math.ceil(am.months / 12); k++) {
+    const ix = rows.map((r, i) => i).filter((i) => Math.floor(rows[i].k / 12) === k);
+    yearsOut.push({ from: rows[ix[0]].month, months: ix.length,
+      index: sum(ix.map((i) => am.by_year[rows[i].year].index)) / ix.length,
+      cannibal: sum(ix.map((i) => cannibalFactor(rows[i].year, year, cannibal, cap))) / ix.length,
+      curve: sum(ix.map((i) => base[i])), own: sum(ix.map((i) => own[i])), expected: sum(ix.map((i) => own[i] * availability * deg[i])) });
+  }
+  const calendar = [{ year, index: 1.0, curve: revenue, own: revenue }];
+  for (const y of Object.keys(am.by_year).map(Number).sort((a, b) => a - b)) {
+    if (y === year) continue;
+    const i = am.by_year[y].index;
+    calendar.push({ year: y, index: i, curve: revenue * i, own: revenue * i * cannibalFactor(y, year, cannibal, cap) });
+  }
+  const byRate = rates.map((c) => { const v = lev(net(path(c))); return { rate: c, value: v, offer: v * (1 - risk) * (1 - margin) }; });
+  return { start: am.start, months: am.months, year, revenue, index: am.index, steps, offer: s6, value: s4, years: yearsOut, calendar, by_rate: byRate,
+    cannibal, cap };
+}
+
+// The anchored revenue in the shape floorValue takes (availability and degradation are floorValue's own).
+export function anchorTm(am, { cannibal = 0.0, cap = 1.0 } = {}) {
+  const rows = am.rows.map((r) => { const v = r.base * cannibalFactor(r.year, am.year, cannibal, cap); return { month: r.month, k: r.k, year: r.year, intrinsic: v, spot: v, scen: new Map() }; });
+  return { start: am.start, months: am.months, rows, ys: [], yRef: am.year };
 }
 
 // ------------------------------------------------------------------ revenue floor

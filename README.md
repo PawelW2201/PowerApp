@@ -21,9 +21,12 @@ how European power markets work on public data.
   its size matters: its own trades move the price against it (an impact estimated from the zone's history), so a
   chart shows € per MW falling as the battery grows. Where the grid charges for energy drawn to charge (Hungary's
   14.13 €/MWh is filled in; type any zone's), every cycle has to beat it, and the bridge shows what it costs after
-  the battery drops the spreads that no longer pay. The same battery can carry a revenue floor instead: a put on
-  each year's revenue, priced with Black-76, with the fee, the chance it pays, and the share of upside that would
-  pay for it instead (a zero-cost collar).
+  the battery drops the spreads that no longer pay. Since most of a battery's money is in intraday and balancing,
+  which public data doesn't show, it can also be priced off your own figure for a year: the curve moves it to
+  later years (by price level or day-ahead spreads, or not at all) and your view of cannibalization takes its
+  share, with the offer for other rates side by side. The figure stays in your browser. The same battery can
+  carry a revenue floor instead: a put on each year's revenue, priced with Black-76, with the fee, the chance it
+  pays, and the share of upside that would pay for it instead (a zero-cost collar).
 - **Options** works on its own too: options on a future (Black-76 or Bachelier, greeks, implied vol, value against
   the future), an average-price option on a delivery month priced both as a European on the month future and
   as an Asian on the daily fixings (moment matching and Monte Carlo, on a two-factor forward model), and a

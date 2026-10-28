@@ -130,10 +130,41 @@ for extra in ({}, {"fee": 14.13}):
     a = dict(start="2027-04-01", months=3, hours=2, cycles=1.2, impact=0.1, sizes=[0.0, 100.0, 500.0, 1000.0],
              risk=0.1, margin=0.05, discount=0.05, **extra)
     sizes.append({"args": a, "result": rfq.toll_sizes(cv_s, DOCS, YEARS, today=TODAY, **{**a, "start": dt.date(2027, 4, 1)})})
+# priced off a figure of your own (made up here), moved by the curve and a view of cannibalization
+STATS_26 = {**STATS, "years": {**STATS["years"], "2026": {**STATS["years"]["2025"], "monthly": {
+    k: v[:10] + [None, None] for k, v in STATS["years"]["2025"]["monthly"].items()}}}}   # a year ten months in
+QUOTES_26 = [Quote("Nov26", 120.0, 135.0), Quote("Dec26", 115.0, 128.0), Quote("Cal27", 92.0, 98.0), Quote("Cal28", 84.0, None)]
+anchors = []
+for name, quotes, stats_key, a in [
+    ("by price level", QUOTES, "base", dict(index="level", year=2025, start="2027-04-01", months=15, growth=0.02, hours=2, cycles=1.5,
+                                            fee=0.0, round_trip=0.85, cannibal=0.1, cap=0.5)),
+    ("by day-ahead spreads, beyond the quotes", QUOTES, "base", dict(index="spreads", year=2025, start="2027-01-01", months=30, growth=0.03,
+                                                                     hours=2, cycles=1.3, fee=14.13, round_trip=0.88, cannibal=0.2, cap=0.7)),
+    ("not following the curve", QUOTES, "base", dict(index="flat", year=2025, start="2027-01-01", months=12, growth=0.0, hours=1, cycles=1.0,
+                                                     fee=0.0, round_trip=0.85, cannibal=0.05, cap=1.0)),
+    ("a year ten months in, by level", QUOTES_26, "26", dict(index="level", year=2026, start="2027-01-01", months=24, growth=0.0, hours=2,
+                                                             cycles=1.5, fee=14.13, round_trip=0.85, cannibal=0.15, cap=0.6)),
+    ("a year ten months in, by spreads", QUOTES_26, "26", dict(index="spreads", year=2026, start="2027-01-01", months=24, growth=0.0,
+                                                               hours=4, cycles=1.1, fee=14.13, round_trip=0.85, cannibal=0.0, cap=0.5)),
+]:
+    st = STATS if stats_key == "base" else STATS_26
+    start = dt.date.fromisoformat(a["start"])
+    cv_a, _ = rfq.tenor_curve(quotes, "DE", st, YEARS, "multiplicative", start, a["months"], a["growth"])
+    am = rfq.anchor(cv_a, st, YEARS, "multiplicative", start=start, months=a["months"], revenue=150000.0, year=a["year"],
+                    index=a["index"], hours=a["hours"], round_trip=a["round_trip"], cycles=a["cycles"], fee=a["fee"], today=TODAY)
+    terms = dict(availability=0.96, degradation=0.025, discount=0.05)
+    v = rfq.anchor_value(am, cannibal=a["cannibal"], cap=a["cap"], risk=0.12, margin=0.04, today=TODAY, **terms)
+    fl = rfq.floor_value(rfq.anchor_tm(am, cannibal=a["cannibal"], cap=a["cap"]), floor=0.7, vol_year=0.3, vol_drift=0.1, cap=1.2,
+                         margin=0.1, realism=1.0, other=0.0, trend=0.0, today=TODAY, **terms)
+    anchors.append({"name": name, "quotes": [{"product": q.product, "base": q.base, "peak": q.peak} for q in quotes], "stats": stats_key,
+                    "args": a, "terms": terms, "anchor": iso({k: am[k] for k in ("ref", "ref_months", "by_year")}),
+                    "bases": [r["base"] for r in am["rows"]], "value": iso({k: v[k] for k in ("steps", "offer", "value", "years", "calendar", "by_rate")}),
+                    "floor": iso({k: fl[k] for k in ("expected", "fair_fee", "fee", "chance")})})
+
 hm = rfq.history_months(DOCS, "DE", "solar")[(2025, 5)]
 months_check = {"key": "2025-5", "days": len(hm.days), "mean": hm.mean, "daytypes": [d.daytype for d in hm.days],
                 "gen0": hm.days[0].gen[:24]}
 json.dump({"today": TODAY.isoformat(), "years": YEARS, "quotes": [{"product": q.product, "base": q.base, "peak": q.peak} for q in QUOTES],
            "stats": STATS, "docs": {str(y): d for y, d in DOCS.items()}, "cases": cases, "battery": battery,
-           "sizes": sizes, "history": months_check}, sys.stdout, separators=(",", ":"))
+           "sizes": sizes, "history": months_check, "anchors": anchors}, sys.stdout, separators=(",", ":"))
 print()

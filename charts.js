@@ -399,7 +399,7 @@ export function lineChart(container, opts) {
     svg("line", { x1: m.l, x2: m.l + pw, y1: m.t + ph + 0.5, y2: m.t + ph + 0.5, class: "base" }, root2);
     const xt = niceTicks(xs[0], xs[n - 1], Math.max(2, Math.floor(pw / 70)));
     for (const v of xt) {
-      if (v < xs[0] || v > xs[n - 1]) continue;
+      if (v < xs[0] || v > xs[n - 1] || (opts.xInt && !Number.isInteger(v))) continue;   // xInt: whole numbers only (years)
       const xx = X(v);
       svg("line", { x1: xx, x2: xx, y1: m.t + ph, y2: m.t + ph + 4, class: "base" }, root2);
       svg("text", { x: xx, y: m.t + ph + 16, class: "tick", "text-anchor": "middle" }, root2).textContent = xFmt(v);
