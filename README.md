@@ -26,6 +26,11 @@ how European power markets work on public data.
   the future), an average-price option on a delivery month priced both as a European on the month future and
   as an Asian on the daily fixings (moment matching and Monte Carlo, on a two-factor forward model), and a
   clean spark spread option (Kirk, with a Monte Carlo check).
+- **Intraday** is a toy for one question: is it worth waiting? A battery trades a day whose intraday prices drift
+  away from day-ahead and spike when something breaks (all made up, fair on average). Four ways to run it on the
+  same simulated days: keep the day-ahead schedule, re-plan every hour and trade at once (a rolling LP), trade each
+  hour at its close with the optimal policy (a dynamic programme), or know every price in advance. The day comes
+  from your curve or is made up; you set the drift, the spikes and the trading cost.
 
 This repository holds **only the app's code**. It contains no data: when you open Today, the app reads
 `summary.json` from the `dashboard-data` branch of your private PowerDesk repository, and Curve and RfQ read the
@@ -59,6 +64,7 @@ To install it: in Chrome or Edge use *Install app*; on Android use *Add to Home 
 | `options.js` | Option pricing; a port of PowerDesk's `powerdesk/options.py` |
 | `curve.js` | The forward curve; a port of PowerDesk's `powerdesk/curve.py` |
 | `rfq.js` | PPA and toll pricing against the curve; a port of PowerDesk's `powerdesk/rfq.py` |
+| `intraday.js` | The intraday simulator; a port of PowerDesk's `powerdesk/intraday.py` |
 | `charts.js` | Small charts: step lines for prices and load, a scatter for price against residual load, lines for option values and curves, and the bridge (waterfall) behind an offer |
 | `sw.js` | Offline copy of the app's own files (never touches GitHub data requests) |
 | `manifest.webmanifest`, `icons/` | Install metadata and icons |

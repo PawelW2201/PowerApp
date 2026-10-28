@@ -4,14 +4,15 @@ import { stepChart, scatterChart, lineChart, waterfallChart, crosshairGroup, leg
 import * as opt from "./options.js";
 import * as crv from "./curve.js";
 import * as rfq from "./rfq.js";
+import * as idm from "./intraday.js";
 import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, dayNum, weekday, baseHours, isHoliday, zonedToUtc, parse, MONTH_ABBR } from "./calendar.js";
 
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 const STORE = "powerapp.v1";
 const DATA_CACHE = "pa-data-v1";
 const DEFAULT_BRANCH = "dashboard-data";
 const RAW = "application/vnd.github.raw+json";
-const TABS = ["today", "products", "curve", "rfq", "options"];
+const TABS = ["today", "products", "curve", "rfq", "options", "intraday"];
 const TZ = "Europe/Berlin";
 const DESK_TZ = "Europe/Zurich";   // whose "today" the brief is about
 const C = { price: "var(--s-1)", residual: "var(--s-2)", renew: "var(--s-3)", load: "var(--s-load)", hist: "var(--s-hist)", sel: "var(--ink)" };
@@ -188,7 +189,7 @@ function render() {
   const main = h("main", { id: "view", tabindex: "-1" });
   app.replaceChildren(rail(), h("div", { class: "main-col" }, topbar(), h("div", { id: "status" }), main), tabbar());
   renderStatus();
-  const view = { today: viewToday, products: viewProducts, curve: viewCurve, rfq: viewRfq, options: viewOptions }[state.tab];
+  const view = { today: viewToday, products: viewProducts, curve: viewCurve, rfq: viewRfq, options: viewOptions, intraday: viewIntraday }[state.tab];
   try { main.appendChild(view()); }
   catch (e) { console.error(e); main.appendChild(h("p", { class: "empty", text: `This view couldn't be drawn: ${e.message}` })); }
   const sy = state.ui[`scroll:${state.tab}`];
@@ -199,13 +200,14 @@ function render() {
 function brand() {
   return h("span", { class: "brand" }, h("img", { src: "icons/icon.svg", alt: "", width: 26, height: 26 }), h("span", { class: "brand-name", text: "PowerApp" }));
 }
-const TAB_LABEL = { today: "Today", products: "Products", curve: "Curve", rfq: "RfQ", options: "Options" };
+const TAB_LABEL = { today: "Today", products: "Products", curve: "Curve", rfq: "RfQ", options: "Options", intraday: "Intraday" };
 const TAB_ICON = {
   today: "M3 17h3v-4h3v-6h3v9h3v-5h3v3h3",
   products: "M4 5h16v14H4zM4 10h16M9 10v9M14 10v9",
   curve: "M3 17c3 0 4-9 7-9s3 6 6 6 3-8 5-8M3 21h18",
   rfq: "M3.5 3.5h8l9 9-8 8-9-9zM8 8h.01",
   options: "M3 15h8l9-9M3 20h18",
+  intraday: "M13 3 5 14h6l-1 7 8-11h-6z",
 };
 function navIcon(d) {
   const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -677,7 +679,7 @@ async function loadCurveStats(zone) {
   curveStats[zone] = "loading";
   const name = `curve-${zone}.json`;
   const cached = await cacheGet(name);
-  const show = () => { if (state.tab === "curve" || state.tab === "rfq") render(); };
+  const show = () => { if (state.tab === "curve" || state.tab === "rfq" || state.tab === "intraday") render(); };
   if (cached) { try { curveStats[zone] = JSON.parse(cached.text); show(); } catch { /* stale */ } }
   try {
     const text = await gh(contentsPath(`curve/${zone}.json`, { ...cfg, branch: DATA_BRANCH }), RAW);
@@ -1652,6 +1654,205 @@ function spreadSection() {
     out);
   draw();
   return sec;
+}
+
+// ------------------------------------------------------------------ Intraday
+// A battery in a made-up intraday market: committing early against waiting (intraday.js, a port of
+// PowerDesk's intraday.py). The day-ahead day comes from the Curve tab's curve or is made up; all of
+// intraday is a toy, on purpose.
+const ID_DEFAULTS = { day: "curve", month: "", dt: "0", bh: "2", cycles: "2", rt: "85", sigma: "8", phi: "80", perDay: "1.5",
+  size: "100", length: "2", shape: "80", cost: "2", days: "500" };
+const idCfg = () => ({ ...ID_DEFAULTS, ...(cfg.intraday || {}) });
+const saveId = (patch) => saveCfg({ intraday: { ...idCfg(), ...patch } });
+const MADE_UP_DAY = [92, 86, 82, 81, 84, 93, 110, 112, 95, 70, 48, 38, 33, 30, 33, 45, 62, 88, 112, 140, 180, 150, 118, 104];
+const ID_POLICY = {
+  day_ahead: { name: "Day-ahead", sub: "keeps the auction schedule", color: "var(--s-hist)" },
+  rolling: { name: "Rolling LP", sub: "re-plans every hour, trades at once", color: "var(--s-2)" },
+  patient: { name: "Patient", sub: "trades each hour at its close", color: "var(--s-1)" },
+  oracle: { name: "Oracle", sub: "knows every price in advance", color: "var(--s-3)" },
+};
+const ID_SWEEP = [0, 0.5, 1, 2, 3, 4];
+const ID_DAYTYPES = [{ value: "0", label: "Weekday" }, { value: "1", label: "Saturday" }, { value: "2", label: "Sunday, holiday" }];
+const idMemo = { curveKey: null, cv: null, key: null, result: null, sweepKey: null, sweep: null, run: 0 };
+const hourLabel = (v) => `${String(Math.round(v)).padStart(2, "0")}:00`;
+
+// One day of the curve: the first day of the month with that day type and 24 hours.
+function curveDay(cv, month, dt) {
+  const days = new Map();
+  for (let i = 0; i < cv.day.length; i++) {
+    const d = cv.day[i], { y, m } = ymd(d);
+    if (dayNum(y, m, 1) !== month) continue;
+    if (!days.has(d)) days.set(d, []);
+    days.get(d).push(cv.price[i]);
+  }
+  for (const [d, ps] of days) if (ps.length === 24 && crv.daytype(d) === dt) return { day: d, prices: ps };
+  for (const [d, ps] of days) if (ps.length === 24) return { day: d, prices: ps };
+  return null;
+}
+
+function viewIntraday() {
+  const c0 = idCfg(), cc = curveCfg(), zone = CURVE_ZONES.includes(cc.zone) ? cc.zone : "DE";
+  if (connected()) loadCurveStats(zone);
+  const raw = curveStats[zone], stats = statsReady(raw) ? raw : null;
+  const allYears = stats ? Object.keys(stats.years).map(Number).sort((a, b) => a - b) : [];
+  const years = (cc.years || (stats ? defaultYears(stats) : [])).filter((y) => allYears.includes(y));
+  const quotes = (cc.quotes[zone] || []).map((q) => ({ product: (q.product || "").trim(), base: num0(q.base), peak: num0(q.peak) }))
+    .filter((q) => q.product && (q.base != null || q.peak != null));
+  // the curve, as on the Curve tab (kept while nothing it depends on changes)
+  const curveKey = JSON.stringify([zone, quotes, years, cc.mode, stats && stats.generated_utc]);
+  if (idMemo.curveKey !== curveKey) {
+    idMemo.curveKey = curveKey; idMemo.cv = null;
+    if (quotes.length) { try { const cv = crv.build(quotes, CURVE_MARKET(zone), stats, years, cc.mode); if (cv.months.length) idMemo.cv = cv; } catch { /* the Curve tab says why */ } }
+  }
+  const cv = idMemo.cv, useCurve = c0.day === "curve" && cv;
+  const months = cv ? cv.months : [];
+  const monthPick = months.find((m) => m.label === c0.month) || months.find((m) => ymd(m.month).m === 5) || months[0];
+  const dt = ["0", "1", "2"].includes(c0.dt) ? +c0.dt : 0;
+  let da = MADE_UP_DAY, dayText = "A made-up day: a solar trough at noon and an evening peak. Not market prices.";
+  if (useCurve) {
+    const d = curveDay(cv, monthPick.month, dt);
+    if (d) { da = d.prices; dayText = `${dayName(isoDate(d.day), true)} ${ymd(d.day).y} on your ${zone} curve (${quotes.length} quote${quotes.length > 1 ? "s" : ""}, shaped ${cc.mode === "additive" ? "in fixed €/MWh" : "to scale with price"}${stats ? "" : ", flat within blocks without history"}).`; }
+  }
+
+  const out = h("div", { class: "id-out", "aria-live": "polite" });
+  const later = debounce(() => compute(), 350);
+  const field = (label, key, { hint } = {}) => h("label", { class: "field" }, h("span", { text: label }),
+    h("input", { class: "input", type: "text", inputmode: "decimal", value: idCfg()[key], autocomplete: "off", spellcheck: "false",
+      oninput: (e) => { saveId({ [key]: e.target.value }); later(); } }),
+    hint ? h("small", { class: "hint", text: hint }) : null);
+
+  const monthSel = months.length ? h("select", { class: "select", "aria-label": "Month", onchange: (e) => { saveId({ month: e.target.value }); render(); } },
+    months.map((m) => h("option", { value: m.label, selected: m === monthPick || null }, m.label))) : null;
+  const head = section("id-head", kicker("A battery in intraday, simulated"), h("h1", { class: "headline", text: "Intraday" }),
+    h("p", { class: "lede", text: "Is it worth waiting? A battery trades a day whose intraday prices drift away from day-ahead and spike when something breaks. Four ways to run it, on the same simulated days: keep the day-ahead schedule, re-plan every hour and trade at once (a rolling LP), wait and trade each hour at its close, or know every price in advance." }),
+    h("div", { class: "filters" },
+      seg("Day", [{ value: "curve", label: "From your curve", disabled: !cv }, { value: "made", label: "A made-up day" }], useCurve ? "curve" : "made",
+        (v) => { saveId({ day: v }); render(); }),
+      useCurve ? h("label", { class: "inline-field" }, h("span", { text: "Month" }), monthSel) : null,
+      useCurve ? seg("Day type", ID_DAYTYPES, String(dt), (v) => { saveId({ dt: v }); render(); }) : null),
+    h("p", { class: "note" }, dayText, cv ? "" : " ", cv ? null : h("a", { class: "linkish", href: "#/curve" }, `Type quotes for ${zone} on the Curve tab to use your own curve.`)));
+
+  const form = section("id-form",
+    h("div", { class: "filters" },
+      seg("Duration", [{ value: "1", label: "1 hour" }, { value: "2", label: "2 hours" }, { value: "4", label: "4 hours" }], String(c0.bh), (v) => { saveId({ bh: v }); render(); }),
+      seg("Cycles", [{ value: "1", label: "At most 1 cycle a day" }, { value: "2", label: "At most 2" }], c0.cycles === "1" ? "1" : "2", (v) => { saveId({ cycles: v }); render(); })),
+    h("div", { class: "form-grid even" },
+      field("Drift, €/MWh an hour", "sigma", { hint: "how far forecasts move prices" }),
+      field("Drift that carries on, %", "phi", { hint: "to the next hour" }),
+      field("Spikes a day", "perDay", { hint: "a unit trips, a forecast busts" }),
+      field("Spike size, €/MWh", "size", { hint: "on average" }),
+      field("Spike length, hours", "length", { hint: "on average" }),
+      field("Spikes going the day's way, %", "shape", { hint: "up at the peak, down at noon" }),
+      field("Trading cost, €/MWh", "cost", { hint: "bid-ask and fees, each MWh traded" }),
+      field("Round trip, %", "rt"),
+      field("Days simulated", "days")));
+
+  function inputs() {
+    const c = idCfg();
+    const opts = { sigma: clamp(numOr(c.sigma, 8), 0, 500), phi: clamp(numOr(c.phi, 80) / 100, 0, 0.98), perDay: clamp(numOr(c.perDay, 1.5), 0, 24),
+      size: clamp(numOr(c.size, 100), 0, 5000), length: clamp(numOr(c.length, 2), 1, 48), shape: clamp(numOr(c.shape, 80) / 100, 0, 1),
+      cost: clamp(numOr(c.cost, 2), 0, 1000) };
+    const bat = { hours: [1, 2, 4].includes(+c.bh) ? +c.bh : 2, roundTrip: clamp(numOr(c.rt, 85) / 100, 0.5, 1), cycles: c.cycles === "1" ? 1 : 2 };
+    return { opts, bat, days: Math.round(clamp(numOr(c.days, 500), 50, 5000)) };
+  }
+
+  function compute() {
+    const { opts, bat, days } = inputs();
+    const key = JSON.stringify([da, opts, bat, days]);
+    const run = ++idMemo.run;
+    if (idMemo.key === key && idMemo.result) return show(idMemo.result, { opts, bat, days, run });
+    out.replaceChildren(h("p", { class: "note", text: `Simulating ${int(days)} days…` }));
+    setTimeout(() => {
+      if (run !== idMemo.run) return;
+      try {
+        const r = idm.simulate(idm.world(da, opts), idm.battery(bat), { days, seed: 7 });
+        idMemo.key = key; idMemo.result = r;
+        show(r, { opts, bat, days, run });
+      } catch (e) { out.replaceChildren(h("p", { class: "warn-text", text: e.message })); }
+    }, 30);
+  }
+
+  function show(r, { opts, bat, days, run }) {
+    const P = r.policies, base = P.day_ahead.expected;
+    const wait = P.patient.expected - P.rolling.expected, hind = P.oracle.expected - P.patient.expected;
+    const dayBox = h("div", { class: "chart-box" }), sweepBox = h("div", { class: "chart-box" });
+    const rows = idm.POLICIES.map((k) => h("tr", null, h("th", { scope: "row", text: ID_POLICY[k].name }),
+      num(eur(P[k].expected)), num(k === "day_ahead" ? "—" : signed(P[k].expected - base, eur)),
+      num(k === "day_ahead" ? eur(P[k].p10) : `${eur(P[k].p10)}–${eur(P[k].p90)}`, "wide"), num(p1(P[k].traded))));
+    const ex = r.example;
+    const same = ex && ex.actions.rolling.join() === Array.from(ex.actions.patient).join();
+    const exNote = ex ? `That day the patient trader made ${eur(ex.values.patient)} and the rolling LP ${eur(ex.values.rolling)}; the oracle ${eur(ex.values.oracle)} and day-ahead ${eur(ex.values.day_ahead)}.` +
+      (same ? " Both ended the day doing the same, at different prices: the rolling LP made its changes as soon as it re-planned, at the quotes of the moment, the patient trader at each hour's close." : "") : "";
+    const strip = ex ? actionStrip(ex.actions, ["rolling", "patient", "oracle"]) : null;
+    out.replaceChildren(
+      h("div", { class: "rfq-block" },
+        h("div", { class: "stats" }, ...idm.POLICIES.map((k) => stat(ID_POLICY[k].name, eur(P[k].expected), `a day per MW: ${ID_POLICY[k].sub}`))),
+        h("p", { class: "lede", text: `Waiting is worth ${signed(wait, eur)} a day per MW over the rolling LP (${pct(wait / P.rolling.expected, 1)}). Hindsight would add another ${eur(hind)}: no way of trading gets near the oracle.` }),
+        table(["", "€ per MW a day", "Over day-ahead", h("th", { class: "wide", text: "Most days (10th–90th)" }), "MWh traded"], rows, { cls: "wrap", caption: "The four ways of trading, on the same simulated days" }),
+        h("p", { class: "note", text: `On ${int(days)} simulated days of a ${bat.hours}-hour battery, at most ${bat.cycles} cycle${bat.cycles > 1 ? "s" : ""} a day. The patient trader's value is exact (its programme's own); the others are averages of the simulated days, give or take ${eur(2 * P.rolling.se)} for the rolling LP and ${eur(2 * P.oracle.se)} for the oracle.` })),
+      ex ? h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: "The day waiting paid most" }), dayBox, strip,
+        legend([{ name: "Charge (buy)", color: "var(--s-hist)", dot: true }, { name: "Discharge (sell)", color: "var(--ink-2)", dot: true }]),
+        h("p", { class: "note", text: exNote })) : null,
+      h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: "As spikes get more frequent" }), sweepBox),
+      h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: "How the toy works" }),
+        h("p", { class: "note", text: "Each hour's final intraday price is its day-ahead price plus a drift that carries on from hour to hour (forecasts going wrong) and spikes, which mostly go the way of the day: up in its dear half, down in its cheap half. Before an hour closes, the market quotes it at its expected final price, and on average intraday equals day-ahead, so whatever a way of trading earns beyond day-ahead comes from using what it learns, not from a bias." }),
+        h("p", { class: "note", text: "All four sell the day-ahead schedule in the auction. Every MWh traded in intraday after that costs the trading cost. The rolling LP plans the rest of the day every hour on the quotes and trades the plan at once, changing it only when the new plan beats the old by more than the trades cost. The patient trader waits and trades each hour at its close, choosing by a dynamic programme that knows how the world moves: it holds energy and headroom while the chance of a better price later is worth more than the spread on offer now." }),
+        h("p", { class: "note", text: "With free trading the rolling LP gets nearly what the patient trader gets: committing early only costs what changing its mind costs, and that's nothing. Make trading cost something, or spikes common, and the gap opens. Most of the oracle's lead is hindsight." }),
+        h("p", { class: "note", text: "A toy: one day, whole hours, whole MWh, as much liquidity as it wants at the quoted price, and the same seeded draw of days every time." })));
+    requestAnimationFrame(() => {
+      if (ex && dayBox.isConnected) {
+        lineChart(dayBox, { x: da.map((_, i) => i), xFmt: hourLabel, xName: "", fmt: p2, tickFmt: tick, height: 180, zero: true,
+          series: [{ name: "Day-ahead", values: da, color: "var(--s-hist)" }, { name: "Intraday, final", values: ex.intraday, color: "var(--ink-2)" }],
+          xTitle: "Hour", label: "Day-ahead and final intraday prices on the day waiting paid most, €/MWh" });
+        dayBox.appendChild(legend([{ name: "Day-ahead", color: "var(--s-hist)" }, { name: "Intraday, final", color: "var(--ink-2)" }]));
+      }
+    });
+    sweepLater({ opts, bat, run, sweepBox });
+  }
+
+  // each policy against spikes a day, a point at a time after the page is drawn
+  function sweepLater({ opts, bat, run, sweepBox }) {
+    const days = 200, key = JSON.stringify([da, { ...opts, perDay: null }, bat, days]);
+    const draw = (rows) => {
+      if (run !== idMemo.run || !sweepBox.isConnected) return;
+      sweepBox.replaceChildren();
+      const series = idm.POLICIES.map((k) => ({ name: ID_POLICY[k].name, values: rows.map((r) => r[k]), color: ID_POLICY[k].color }));
+      lineChart(sweepBox, { x: rows.map((r) => r.per_day), xFmt: (v) => upTo2.format(v), xName: "Spikes a day", fmt: eur, tickFmt: (v) => `€${tick(v)}`,
+        height: 190, series, xTitle: "Spikes a day", rest: opts.perDay, marks: [{ x: opts.perDay, label: "yours" }],
+        label: "Value of each way of trading against how many spikes a day, € per MW a day" });
+      sweepBox.appendChild(legend(series.map((x) => ({ name: x.name, color: x.color }))));
+      sweepBox.appendChild(h("p", { class: "note", text: `€ per MW a day, everything else as set, on ${days} simulated days per point. With no spikes there's little to wait for: the drift alone is mostly captured by re-planning. Each spike is a chance the patient trader keeps energy and headroom for, and the rolling LP has often committed away.` }));
+    };
+    if (idMemo.sweepKey === key && idMemo.sweep) return requestAnimationFrame(() => draw(idMemo.sweep));
+    sweepBox.replaceChildren(h("p", { class: "note", text: "Working out the other spike rates…" }));
+    const b = idm.battery(bat), rows = [];
+    const step = () => {
+      if (run !== idMemo.run) return;
+      const f = ID_SWEEP[rows.length];
+      try {
+        const r = idm.simulate(idm.world(da, { ...opts, perDay: f }), b, { days, seed: 7 });
+        rows.push({ per_day: f, ...Object.fromEntries(idm.POLICIES.map((k) => [k, r.policies[k].expected])) });
+      } catch (e) { sweepBox.replaceChildren(h("p", { class: "warn-text", text: e.message })); return; }
+      if (rows.length < ID_SWEEP.length) setTimeout(step, 0);
+      else { idMemo.sweepKey = key; idMemo.sweep = rows; draw(rows); }
+    };
+    setTimeout(step, 0);
+  }
+
+  const view = h("div", { class: "intraday" }, head, form, section("id-results", out));
+  compute();
+  return view;
+}
+
+// What each way of trading did, hour by hour: a row of 24 cells per policy.
+function actionStrip(actions, names) {
+  const what = ["idle", "charge", "discharge"];
+  const hours = h("div", { class: "act-row act-hours", "aria-hidden": "true" }, h("span", { class: "act-name" }),
+    ...Array.from({ length: 24 }, (_, i) => h("span", { class: "act-h", text: i % 6 === 0 ? String(i).padStart(2, "0") : "" })));
+  const rows = names.map((k) => h("div", { class: "act-row" }, h("span", { class: "act-name", text: ID_POLICY[k].name }),
+    ...Array.from(actions[k]).map((a, i) => h("span", { class: `act-cell ${a === 1 ? "ch" : a === 2 ? "dis" : ""}`.trim(), title: `${hourLabel(i)} ${what[a]}` }))));
+  const label = names.map((k) => `${ID_POLICY[k].name}: ${Array.from(actions[k]).map((a, i) => (a ? `${what[a]} ${hourLabel(i)}` : null)).filter(Boolean).join(", ")}`).join(". ");
+  return h("div", { class: "act-strip", role: "img", "aria-label": label }, hours, ...rows);
 }
 
 // ------------------------------------------------------------------ sheets

@@ -14,4 +14,4 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: node --test tests/calendar.test.mjs tests/options.test.mjs tests/curve.test.mjs tests/rfq.test.mjs
+      - run: node --test tests/calendar.test.mjs tests/options.test.mjs tests/curve.test.mjs tests/rfq.test.mjs tests/intraday.test.mjs
