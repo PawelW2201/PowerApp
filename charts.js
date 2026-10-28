@@ -39,7 +39,11 @@ function domain(values, { zero = false } = {}) {
   if (zero) { lo = Math.min(0, lo); hi = Math.max(0, hi); }
   const padv = (hi - lo) * 0.08 || Math.abs(hi) * 0.05 || 1;
   const ticks = niceTicks(lo - padv, hi + padv, 4);
-  return { y0: Math.min(ticks[0], lo), y1: Math.max(ticks[ticks.length - 1], hi), ticks };
+  // A little headroom so the extremes don't sit on the frame and read as clipped; a zero
+  // baseline the data rests on stays at the edge.
+  const y0 = zero && lo >= 0 ? Math.min(ticks[0], 0) : Math.min(ticks[0], lo - padv / 2);
+  const y1 = zero && hi <= 0 ? Math.max(ticks[ticks.length - 1], 0) : Math.max(ticks[ticks.length - 1], hi + padv / 2);
+  return { y0, y1, ticks };
 }
 
 // Local time labels (t in unix seconds).
@@ -354,6 +358,7 @@ export function scatterChart(container, opts) {
  *  opts.xFmt     x formatter (ticks and readout); opts.fmt / opts.tickFmt for y
  *  opts.marks    [{ x, label }] vertical reference lines (the strike, today's price); the readout
  *                rests on the first one until someone points at the chart
+ *  opts.rest     an x for the readout to rest on instead (default: the first mark, else the last x)
  *  opts.xTitle, opts.height, opts.label, opts.zero
  */
 export function lineChart(container, opts) {
@@ -365,7 +370,7 @@ export function lineChart(container, opts) {
   container.appendChild(root);
   let W = 0, geo = null, s = null, cur = null;
   const nearest = (x) => { let b = 0; for (let i = 1; i < n; i++) if (Math.abs(xs[i] - x) < Math.abs(xs[b] - x)) b = i; return b; };
-  const rest = opts.marks && opts.marks.length ? nearest(opts.marks[0].x) : n - 1;
+  const rest = opts.rest != null ? nearest(opts.rest) : opts.marks && opts.marks.length ? nearest(opts.marks[0].x) : n - 1;
 
   function readout(i) {
     head.replaceChildren();

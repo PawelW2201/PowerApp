@@ -3,9 +3,9 @@
 //  - app code (html, js, manifest): network first, saved copy when offline,
 //    so an update is picked up on the next open
 //  - fonts and icons: saved copy first (they never change)
-const VERSION = "pa-app-0.3.0";
+const VERSION = "pa-app-0.4.0";
 const SHELL = [
-  "./", "index.html", "app.js", "charts.js", "calendar.js", "options.js", "manifest.webmanifest", "vendor/qrcode.mjs",
+  "./", "index.html", "app.js", "charts.js", "calendar.js", "options.js", "curve.js", "manifest.webmanifest", "vendor/qrcode.mjs",
   "icons/icon.svg", "icons/icon-192.png", "icons/apple-touch-icon.png",
   "fonts/barlow-latin-400-normal.woff2", "fonts/barlow-latin-500-normal.woff2", "fonts/barlow-latin-600-normal.woff2",
   "fonts/barlow-semi-condensed-latin-600-normal.woff2", "fonts/barlow-semi-condensed-latin-700-normal.woff2",

@@ -2,14 +2,15 @@
 // from the private repo's dashboard-data branch with a read-only token.
 import { stepChart, scatterChart, lineChart, crosshairGroup, legend, fmtClock } from "./charts.js";
 import * as opt from "./options.js";
-import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, weekday, baseHours, isHoliday, zonedToUtc, MONTH_ABBR } from "./calendar.js";
+import * as crv from "./curve.js";
+import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, weekday, baseHours, isHoliday, zonedToUtc, parse, MONTH_ABBR } from "./calendar.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const STORE = "powerapp.v1";
 const DATA_CACHE = "pa-data-v1";
 const DEFAULT_BRANCH = "dashboard-data";
 const RAW = "application/vnd.github.raw+json";
-const TABS = ["today", "products", "options"];
+const TABS = ["today", "products", "curve", "options"];
 const TZ = "Europe/Berlin";
 const DESK_TZ = "Europe/Zurich";   // whose "today" the brief is about
 const C = { price: "var(--s-1)", residual: "var(--s-2)", renew: "var(--s-3)", load: "var(--s-load)", hist: "var(--s-hist)", sel: "var(--ink)" };
@@ -186,7 +187,7 @@ function render() {
   const main = h("main", { id: "view", tabindex: "-1" });
   app.replaceChildren(rail(), h("div", { class: "main-col" }, topbar(), h("div", { id: "status" }), main), tabbar());
   renderStatus();
-  const view = { today: viewToday, products: viewProducts, options: viewOptions }[state.tab];
+  const view = { today: viewToday, products: viewProducts, curve: viewCurve, options: viewOptions }[state.tab];
   try { main.appendChild(view()); }
   catch (e) { console.error(e); main.appendChild(h("p", { class: "empty", text: `This view couldn't be drawn: ${e.message}` })); }
   const sy = state.ui[`scroll:${state.tab}`];
@@ -197,10 +198,11 @@ function render() {
 function brand() {
   return h("span", { class: "brand" }, h("img", { src: "icons/icon.svg", alt: "", width: 26, height: 26 }), h("span", { class: "brand-name", text: "PowerApp" }));
 }
-const TAB_LABEL = { today: "Today", products: "Products", options: "Options" };
+const TAB_LABEL = { today: "Today", products: "Products", curve: "Curve", options: "Options" };
 const TAB_ICON = {
   today: "M3 17h3v-4h3v-6h3v9h3v-5h3v3h3",
   products: "M4 5h16v14H4zM4 10h16M9 10v9M14 10v9",
+  curve: "M3 17c3 0 4-9 7-9s3 6 6 6 3-8 5-8M3 21h18",
   options: "M3 15h8l9-9M3 20h18",
 };
 function navIcon(d) {
@@ -650,6 +652,348 @@ function conventions(market) {
       h("li", null, h("b", { text: "Hours" }), " are real elapsed hours: the day the clocks go forward has 23, the day they go back has 25.")));
 }
 
+// ------------------------------------------------------------------ Curve
+const CURVE_ZONES = ["DE", "FR", "NL", "BE", "AT", "CH", "PL", "CZ", "SK", "HU", "SI", "IT-N", "ES"];
+const CURVE_MARKET = (z) => (z === "IT-N" ? "IT" : z);
+const ZONE_NAME = { DE: "Germany-Luxembourg", FR: "France", NL: "Netherlands", BE: "Belgium", AT: "Austria", CH: "Switzerland",
+  PL: "Poland", CZ: "Czechia", SK: "Slovakia", HU: "Hungary", SI: "Slovenia", "IT-N": "Italy North", ES: "Spain" };
+const DATA_BRANCH = "data";
+const EXAMPLE_QUOTES = [
+  { product: "Nov26", base: "120", peak: "135" }, { product: "Dec26", base: "115", peak: "128" },
+  { product: "Q1-27", base: "108", peak: "120" }, { product: "Q2-27", base: "78", peak: "72" },
+  { product: "Cal27", base: "92", peak: "98" }, { product: "Cal28", base: "84", peak: "89" },
+];
+const SEQ = (i) => `var(--q-${Math.min(4, i + 1)})`;
+
+const curveCfg = () => ({ zone: "DE", years: null, mode: "multiplicative", quotes: {}, month: null, profile: "solar",
+  pproduct: "", weekdays: "weekdays", h0: "17", h1: "21", bh: "2", rt: "85", hmonth: "5", ...(cfg.curve || {}) });
+const saveCurve = (patch) => saveCfg({ curve: { ...curveCfg(), ...patch } });
+
+const curveStats = {};          // zone -> stats | "loading" | {error}
+async function loadCurveStats(zone) {
+  if (!connected() || curveStats[zone]) return;
+  curveStats[zone] = "loading";
+  const name = `curve-${zone}.json`;
+  const cached = await cacheGet(name);
+  if (cached) { try { curveStats[zone] = JSON.parse(cached.text); if (state.tab === "curve") render(); } catch { /* stale */ } }
+  try {
+    const text = await gh(contentsPath(`curve/${zone}.json`, { ...cfg, branch: DATA_BRANCH }), RAW);
+    curveStats[zone] = JSON.parse(text);
+    cachePut(name, text);
+  } catch (e) {
+    if (curveStats[zone] === "loading") curveStats[zone] = { error: e.status === 404 ? "no history for this zone yet" : e.message };
+  }
+  if (state.tab === "curve") render();
+}
+const statsReady = (s) => s && s !== "loading" && !s.error;
+
+function defaultYears(stats) {
+  const ys = Object.keys(stats.years).map(Number).sort((a, b) => a - b);
+  return ys.slice(-3);
+}
+
+function viewCurve() {
+  const cc = curveCfg(), zone = CURVE_ZONES.includes(cc.zone) ? cc.zone : "DE";
+  if (connected()) loadCurveStats(zone);
+  const raw = curveStats[zone], stats = statsReady(raw) ? raw : null;
+  const allYears = stats ? Object.keys(stats.years).map(Number).sort((a, b) => a - b) : [];
+  const years = (cc.years || (stats ? defaultYears(stats) : [])).filter((y) => allYears.includes(y));
+  const quotes = (cc.quotes[zone] || []).map((q) => ({ ...q }));
+  const out = h("div", { class: "curve-out", "aria-live": "polite" });
+
+  const zoneSel = h("select", { class: "select", "aria-label": "Zone", onchange: (e) => { saveCurve({ zone: e.target.value }); render(); } },
+    CURVE_ZONES.map((z) => h("option", { value: z, selected: z === zone || null }, `${z} · ${ZONE_NAME[z]}`)));
+  const yearChips = h("div", { class: "chips", role: "group", "aria-label": "Shape years" }, allYears.map((y) => h("button", {
+    type: "button", class: "chip", "aria-pressed": String(years.includes(y)),
+    onclick: () => { const next = years.includes(y) ? years.filter((x) => x !== y) : [...years, y].sort(); saveCurve({ years: next.length ? next : null }); render(); },
+  }, String(y) + (stats.years[String(y)].full ? "" : " so far"))));
+
+  // quote sheet
+  const rowsBox = h("div", { class: "quote-rows" });
+  const saveQuotes = (qs) => saveCurve({ quotes: { ...curveCfg().quotes, [zone]: qs } });
+  const later = debounce(() => compute(), 250);
+  const drawRows = () => {
+    rowsBox.replaceChildren(...(quotes.length ? [h("div", { class: "quote-row head" }, h("span", { text: "Product" }), h("span", { text: "Base €/MWh" }), h("span", { text: "Peak €/MWh" }), h("span"))] : []),
+      ...quotes.map((q, i) => {
+        const inp = (key, ph) => h("input", { class: "input", value: q[key] ?? "", placeholder: ph, inputmode: key === "product" ? "text" : "decimal",
+          autocomplete: "off", spellcheck: "false", "aria-label": `${key} ${i + 1}`, oninput: (e) => { quotes[i][key] = e.target.value; saveQuotes(quotes); later(); } });
+        return h("div", { class: "quote-row" }, inp("product", "Cal27"), inp("base", "base"), inp("peak", "optional"),
+          h("button", { type: "button", class: "icon-btn small", "aria-label": `Remove row ${i + 1}`, onclick: () => { quotes.splice(i, 1); saveQuotes(quotes); drawRows(); compute(); } }, "×"));
+      }));
+  };
+  drawRows();
+  const quoteCard = section("curve-quotes",
+    h("h2", { class: "h2", text: "Quotes" }),
+    h("p", { class: "note", text: "Months, quarters, seasons and years (Nov26, Q1-27, Sum27, Win27, Cal28), base and, if you have it, peak. Use prices you read in public sources, never ones from a work terminal." }),
+    rowsBox,
+    h("div", { class: "row-btns" },
+      h("button", { type: "button", class: "btn ghost small", onclick: () => { quotes.push({ product: "", base: "", peak: "" }); saveQuotes(quotes); drawRows(); } }, "Add a product"),
+      h("button", { type: "button", class: "btn ghost small", onclick: () => { quotes.splice(0, quotes.length, ...EXAMPLE_QUOTES.map((q) => ({ ...q }))); saveQuotes(quotes); drawRows(); compute(); } }, "Fill in example values"),
+      quotes.length ? h("button", { type: "button", class: "linkish", onclick: () => { quotes.splice(0); saveQuotes(quotes); drawRows(); compute(); } }, "Clear") : null),
+    h("p", { class: "note", text: "The example values are made up to try the tool. They are not market prices." }));
+
+  function compute() {
+    const qs = quotes.map((q) => ({ product: (q.product || "").trim(), base: num0(q.base), peak: num0(q.peak) }))
+      .filter((q) => q.product && (q.base != null || q.peak != null));
+    if (!qs.length) { out.replaceChildren(h("p", { class: "empty", text: "Type at least one quote, or fill in the example, to build the curve." })); return; }
+    let cv;
+    try { cv = crv.build(qs, CURVE_MARKET(zone), stats, years, cc.mode); }
+    catch (e) { out.replaceChildren(h("p", { class: "warn-text", text: `Couldn't build the curve: ${e.message}` })); return; }
+    if (!cv.months.length) { out.replaceChildren(h("p", { class: "warn-text", text: cv.notes.join(" ") || "No usable quotes." })); return; }
+    out.replaceChildren(curveChecks(cv), curveStrip(cv), curveMonthly(cv), curveHourly(cv, zone), curveProfile(cv, stats, years, zone));
+  }
+
+  const head = section("curve-head", kicker("Hourly price forward curve"), h("h1", { class: "headline", text: "Forward curve" }),
+    h("p", { class: "lede", text: "Type the prices you read for months, quarters, seasons and years. The curve reprices them exactly, fills the gaps from history, and gives every hour a price, so any profile can be priced against it." }),
+    h("div", { class: "filters" }, h("label", { class: "inline-field" }, h("span", { text: "Zone" }), zoneSel),
+      seg("Shape", [{ value: "multiplicative", label: "Scales with price" }, { value: "additive", label: "Fixed in €/MWh" }], cc.mode,
+        (v) => { saveCurve({ mode: v }); render(); })),
+    stats ? h("div", null, h("p", { class: "note", text: "Years the seasonal pattern and the hourly shape come from:" }), yearChips)
+      : h("p", { class: "note" }, !connected() ? "Connect the brief (Today tab) to shape the curve with this zone's history. Without it, months nobody quoted are flat and hours are flat within peak and off-peak."
+        : raw === "loading" ? "Loading this zone's history…" : `No history yet (${raw && raw.error}). The curve works without it, flat within blocks.`));
+  const view = h("div", { class: "curve" }, head, quoteCard, section("curve-results", out), stats ? curveHistory(stats, zone) : null);
+  compute();
+  return view;
+}
+const num0 = (x) => { const v = dec(x); return isFinite(v) ? v : null; };
+
+function curveChecks(cv) {
+  const kids = [h("h2", { class: "h2", text: "Do the quotes fit together?" })];
+  if (cv.checks.length) {
+    for (const c of cv.checks)
+      kids.push(h("p", { class: "banner warn" }, `${c.label} ${c.profile} at ${p2(c.quote)} doesn't fit the finer quotes: they imply ${p2(c.implied)} (${signed(c.quote - c.implied)}). The curve follows the finer quotes.`));
+  } else kids.push(h("p", { class: "lede", text: "Yes: the curve reprices every quote exactly." }));
+  const free = cv.months.filter((m) => !m.constrained).map((m) => m.label);
+  if (free.length) kids.push(h("p", { class: "note", text: `No quote covers ${free.join(", ")}: those follow the seasonal pattern at the quotes' overall level (${p2(cv.level)}).` }));
+  for (const n of cv.notes) kids.push(h("p", { class: "note", text: n }));
+  return h("div", { class: "curve-block" }, kids);
+}
+
+// Every standard product inside the horizon, quoted or implied.
+function curveStrip(cv) {
+  const first = cv.months[0].month, last = cv.months[cv.months.length - 1].month;
+  const codes = [];
+  for (const m of cv.months) codes.push(m.label.replace("-", ""));
+  for (let y = ymd(first).y; y <= ymd(last).y; y++) {
+    const yy = String(y % 100).padStart(2, "0");
+    for (let q = 1; q <= 4; q++) codes.push(`Q${q}-${yy}`);
+    codes.push(`Sum${yy}`, `Win${yy}`, `Cal${yy}`);
+  }
+  const zoneNow = CURVE_ZONES.includes(curveCfg().zone) ? curveCfg().zone : "DE";
+  const quotedLabels = new Set((curveCfg().quotes[zoneNow] || []).map((q) => { try { return parse(q.product, 0).label; } catch { return ""; } }));
+  // a function, because a header cell element can only sit in one table
+  const head = () => ["Product", "Base", "Peak", "Off-peak", h("th", { class: "wide", text: "Peak − base" }), ""];
+  const misfit = new Set(cv.checks.map((c) => c.label));
+  const main = [], monthsRows = [];
+  for (const code of codes) {
+    let p; try { p = parse(code, 0); } catch { continue; }
+    if (!cv.covers(p)) continue;
+    const v = cv.product(p), quoted = quotedLabels.has(p.label);
+    const status = !quoted ? h("td", { class: "muted small", text: "implied" })
+      : misfit.has(p.label) ? h("td", { class: "warn-text small", text: "doesn't fit" }) : h("td", { class: "small", text: "quoted" });
+    const row = h("tr", { class: quoted ? "current" : null }, h("th", { scope: "row", text: p.label }),
+      num(p2(v.base)), num(p2(v.peak)), num(p2(v.offpeak)), num(signed(v.peak - v.base), "wide"), status);
+    if (p.kind === "Month") { monthsRows.push(row); if (quoted) main.push(row.cloneNode(true)); }
+    else main.push(row);
+  }
+  return h("div", { class: "curve-block" }, h("h2", { class: "h2", text: "The strip" }),
+    table(head(), main, { caption: "Base, peak and off-peak for the quoted months, and every quarter, season and year in the horizon" }),
+    h("details", { class: "raw" }, h("summary", { text: `Every month (${monthsRows.length})` }), table(head(), monthsRows, { caption: "Every month in the horizon" })),
+    h("p", { class: "note", text: "Implied products come straight from the curve, so they are consistent with every quote: Q2-27 here is what Cal27 and Q1-27 leave for the rest of the year, spread by the seasonal pattern." }));
+}
+
+function curveMonthly(cv) {
+  const box = h("div", { class: "chart-box" });
+  const xs = cv.months.map((_, i) => i);
+  const labels = cv.months.map((m) => m.label);
+  requestAnimationFrame(() => {
+    lineChart(box, { x: xs, xFmt: (v) => labels[Math.round(v)] || "", xName: "", fmt: p2, tickFmt: tick, height: 170, rest: 0,
+      series: [{ name: "Base", values: cv.months.map((m) => m.base), color: "var(--s-1)" },
+        { name: "Peak", values: cv.months.map((m) => m.peak), color: "var(--s-2)" },
+        { name: "Off-peak", values: cv.months.map((m) => m.offpeak), color: "var(--s-3)" }],
+      label: "Monthly base, peak and off-peak prices of the curve" });
+    box.appendChild(legend([{ name: "Base", color: "var(--s-1)" }, { name: "Peak", color: "var(--s-2)" }, { name: "Off-peak", color: "var(--s-3)" }]));
+  });
+  return h("div", { class: "curve-block" }, h("h2", { class: "h2", text: "Month by month" }), box);
+}
+
+function curveHourly(cv, zone) {
+  const cc = curveCfg();
+  const labels = cv.months.map((m) => m.label);
+  let mi = Math.max(0, labels.indexOf(cc.month));
+  const wrap = h("div", { class: "curve-block" });
+  const draw = () => {
+    const m = cv.months[mi], next = mi + 1 < cv.months.length ? cv.months[mi + 1].month : cv.day[cv.day.length - 1] + 1;
+    const idx = []; for (let i = 0; i < cv.day.length; i++) if (cv.day[i] >= m.month && cv.day[i] < next) idx.push(i);
+    const box = h("div", { class: "chart-box" }), avgBox = h("div", { class: "chart-box" });
+    const sel = h("select", { class: "select", "aria-label": "Month", onchange: (e) => { mi = labels.indexOf(e.target.value); saveCurve({ month: e.target.value }); draw(); } },
+      labels.map((l, i) => h("option", { value: l, selected: i === mi || null }, l)));
+    wrap.replaceChildren(h("h2", { class: "h2", text: "Hour by hour" }),
+      h("div", { class: "filters" }, h("label", { class: "inline-field" }, h("span", { text: "Month" }), sel)),
+      box, h("h3", { class: "h3", text: "An average day in that month" }), avgBox,
+      h("p", { class: "note", text: "Peak hours average exactly to the month's peak price and off-peak hours to its off-peak price; inside each block, hours follow the history's shape for that month, day type and hour." }),
+      h("p", { class: "note", text: cc.mode === "additive"
+        ? "Fixed in €/MWh keeps history's gaps between hours in euros, whatever the price level. Switch to Scales with price to see the other convention: neither is right for negative hours, which come from surplus solar and don't follow the gas price."
+        : "Scales with price moves every hour in proportion to the price level, negative hours included, so a dearer curve also gets deeper negative middays. Negative hours come from surplus solar and don't follow the gas price, so Fixed in €/MWh is the other convention to compare." }));
+    requestAnimationFrame(() => {
+      stepChart(box, { t: idx.map((i) => cv.t[i]), step: 3600, tz: getMarket(CURVE_MARKET(zone)).tz, fmt: p2, tickFmt: tick, height: 160,
+        series: [{ name: "Curve", values: idx.map((i) => cv.price[i]), color: "var(--s-1)" }], label: `Hourly forward curve, ${m.label}` });
+      const types = [[0, "Weekday", "var(--s-1)"], [1, "Saturday", "var(--s-2)"], [2, "Sunday or holiday", "var(--s-3)"]];
+      const series = types.map(([d, name, color]) => {
+        const sum = Array(24).fill(0), cnt = Array(24).fill(0);
+        for (const i of idx) if (crv.daytype(cv.day[i]) === d) { sum[cv.hour[i]] += cv.price[i]; cnt[cv.hour[i]]++; }
+        return { name, color, values: sum.map((s, hh) => (cnt[hh] ? s / cnt[hh] : null)) };
+      });
+      lineChart(avgBox, { x: [...Array(24).keys()], xFmt: (v) => `${String(Math.round(v)).padStart(2, "0")}:00`, xName: "", fmt: p2, tickFmt: tick, height: 150, rest: 13,
+        series, label: `Average hourly price by day type, ${m.label}` });
+      avgBox.appendChild(legend(types.map(([, name, color]) => ({ name, color }))));
+    });
+  };
+  draw();
+  return wrap;
+}
+
+function curveProfile(cv, stats, years, zone) {
+  const cc = curveCfg();
+  const wrap = h("div", { class: "curve-block" });
+  const firstCal = cv.months.find((m) => ymd(m.month).m === 1);
+  const dflt = firstCal ? `Cal${String(ymd(firstCal.month).y % 100).padStart(2, "0")}` : cv.months[0].label.replace("-", "");
+  const prodIn = h("input", { class: "input", value: cc.pproduct || dflt, autocomplete: "off", spellcheck: "false", "aria-label": "Product to price",
+    oninput: debounce(() => { saveCurve({ pproduct: prodIn.value }); draw(); }, 250) });
+  const res = h("div", { class: "opt-out", "aria-live": "polite" });
+  const draw = () => {
+    const c = curveCfg();
+    let p;
+    try { p = parse(prodIn.value.trim() || dflt, todayIn(TZ)); } catch (e) { res.replaceChildren(h("p", { class: "warn-text", text: e.message })); return; }
+    if (!cv.covers(p)) { res.replaceChildren(h("p", { class: "warn-text", text: `${p.label} isn't inside the curve's horizon (${cv.months[0].label} to ${cv.months[cv.months.length - 1].label}).` })); return; }
+    const base = cv.product(p);
+    const kids = [];
+    if (c.profile === "block") {
+      const wd = { weekdays: new Set([0, 1, 2, 3, 4]), all: new Set([0, 1, 2, 3, 4, 5, 6]), weekends: new Set([5, 6]) }[c.weekdays] || new Set([0, 1, 2, 3, 4]);
+      const h0 = Math.max(0, Math.min(23, parseInt(c.h0, 10) || 0)), h1 = Math.max(h0 + 1, Math.min(24, parseInt(c.h1, 10) || 24));
+      const b = cv.block(p, wd, h0, h1);
+      kids.push(table(["", "€/MWh"], [
+        h("tr", null, h("th", { scope: "row" }, `${p.label}, ${{ weekdays: "Mon–Fri", all: "every day", weekends: "weekends" }[c.weekdays] || "Mon–Fri"} ${String(h0).padStart(2, "0")}–${String(h1).padStart(2, "0")}`,
+          h("span", { class: "zn", text: `${int(b.hours)} hours` })), num(p2(b.price))),
+        h("tr", null, h("th", { scope: "row", text: "against base" }), num(signed(b.price - base.base))),
+        h("tr", null, h("th", { scope: "row", text: "against peak" }), num(signed(b.price - base.peak))),
+      ], { cls: "opt-tbl", caption: "Block price" }));
+    } else if (c.profile === "solar" || c.profile === "wind") {
+      const prof = stats ? crv.genProfile(stats, years, c.profile) : null;
+      if (!prof) { res.replaceChildren(h("p", { class: "note", text: `Pricing a ${c.profile} profile needs this zone's history (connect the brief), with ${c.profile} output in the chosen years.` })); return; }
+      const cap = cv.capture(p, prof);
+      const realised = realisedCapture(stats, years, c.profile, p, prof);
+      kids.push(table(["", "€/MWh", "Rate"], [
+        h("tr", null, h("th", { scope: "row" }, `${p.label} base`, h("span", { class: "zn", text: "from the curve" })), num(p2(cap.base)), num("100%")),
+        h("tr", null, h("th", { scope: "row" }, `${c.profile === "solar" ? "Solar" : "Wind"} capture price`, h("span", { class: "zn", text: "the curve weighted by the average profile" })), num(p2(cap.price)), num(pct(cap.rate, 1))),
+        realised != null ? h("tr", null, h("th", { scope: "row" }, "Realised capture rate", h("span", { class: "zn", text: `history, ${years.join(", ")}, same months` })), num(p2(cap.base * realised)), num(pct(realised, 1))) : null,
+      ], { cls: "opt-tbl", caption: "Capture price" }));
+      kids.push(h("p", { class: "note", text: c.profile === "solar"
+        ? "The curve's capture rate counts the average daily shape: solar runs in the cheap midday hours. It can't see the weather: on a sunny day those hours are cheaper still than on a cloudy one. History's realised rate includes both, and the gap between the two is roughly the extra discount a PV PPA has to price in, on top of balancing and volume risk."
+        : "Wind runs at all hours, so the daily shape matters little; its value against base comes from the seasons (more wind in winter) and, in history, from the weather: windy hours are cheap hours. The gap to the realised rate is that correlation, which an average curve can't see." }));
+    } else {
+      const k = [1, 2, 4].includes(+c.bh) ? +c.bh : 2, rt = Math.min(1, Math.max(0.5, (dec(c.rt) || 85) / 100));
+      const b = cv.battery(p, k, rt);
+      const realised = stats ? realisedBattery(stats, years, k, p) : null;
+      kids.push(table(["", "€/MW/day", `€/MW over ${p.label}`], [
+        h("tr", null, h("th", { scope: "row" }, `${k}-hour battery, intrinsic`, h("span", { class: "zn", text: `one cycle a day on the curve, ${pct(rt, 0)} round trip` })), num(p1(b.per_day)), num(eur(b.total))),
+        realised != null ? h("tr", null, h("th", { scope: "row" }, "Realised in history", h("span", { class: "zn", text: `same months, ${years.join(", ")}, 85% round trip` })), num(p1(realised)), num(eur(realised * b.days))) : null,
+      ], { cls: "opt-tbl", caption: "Battery value" }));
+      kids.push(h("p", { class: "note", text: "A forward curve is an average, so its daily spreads are smoother than any real day's: it gives the intrinsic value you could lock in today. Realised days swing far more, and the gap between the two lines is the extrinsic value: what a toll buyer pays for and a trading desk has to earn in the day-ahead and intraday markets." }));
+    }
+    res.replaceChildren(...kids);
+  };
+  const c0 = curveCfg();
+  const opts = h("div", { class: "filters" });
+  const drawOpts = () => {
+    const c = curveCfg();
+    opts.replaceChildren(...[
+      seg("Profile", [{ value: "solar", label: "Solar" }, { value: "wind", label: "Wind" }, { value: "battery", label: "Battery" }, { value: "block", label: "Block of hours" }], c.profile,
+        (v) => { saveCurve({ profile: v }); drawOpts(); draw(); }),
+      c.profile === "block" ? h("div", { class: "filters" },
+        seg("Days", [{ value: "weekdays", label: "Mon–Fri" }, { value: "all", label: "Every day" }, { value: "weekends", label: "Weekends" }], c.weekdays, (v) => { saveCurve({ weekdays: v }); drawOpts(); draw(); }),
+        h("label", { class: "inline-field" }, h("span", { text: "From" }), h("input", { class: "input tiny", inputmode: "numeric", value: c.h0, oninput: (e) => { saveCurve({ h0: e.target.value }); draw(); } })),
+        h("label", { class: "inline-field" }, h("span", { text: "to" }), h("input", { class: "input tiny", inputmode: "numeric", value: c.h1, oninput: (e) => { saveCurve({ h1: e.target.value }); draw(); } }))) : null,
+      c.profile === "battery" ? h("div", { class: "filters" },
+        seg("Duration", [{ value: "1", label: "1 hour" }, { value: "2", label: "2 hours" }, { value: "4", label: "4 hours" }], String(c.bh), (v) => { saveCurve({ bh: v }); drawOpts(); draw(); }),
+        h("label", { class: "inline-field" }, h("span", { text: "Round trip %" }), h("input", { class: "input tiny", inputmode: "decimal", value: c.rt, oninput: (e) => { saveCurve({ rt: e.target.value }); draw(); } }))) : null,
+    ].filter(Boolean));   // replaceChildren would print a null as "null"
+  };
+  drawOpts();
+  wrap.append(h("h2", { class: "h2", text: "Price a profile" }),
+    h("div", { class: "filters" }, h("label", { class: "inline-field" }, h("span", { text: "Product" }), prodIn)), opts, res);
+  void c0;
+  draw();
+  return wrap;
+}
+
+// History's realised capture rate over the product's calendar months, weighted by the profile's energy.
+function realisedCapture(stats, years, kind, period, prof) {
+  const months = new Set();
+  for (let n = period.start; n < period.end; n++) months.add(ymd(n).m - 1);
+  let num = 0, den = 0;
+  for (const y of years) {
+    const st = stats.years[String(y)];
+    const rates = st && st.capture && st.capture[kind] && st.capture[kind].rate;
+    if (!rates) continue;
+    for (const m of months) {
+      if (rates[m] == null) continue;
+      const w = prof[m].reduce((a, b) => a + b, 0);
+      num += rates[m] * w; den += w;
+    }
+  }
+  return den > 0 ? num / den : null;
+}
+function realisedBattery(stats, years, k, period) {
+  const days = Array(12).fill(0);
+  for (let n = period.start; n < period.end; n++) days[ymd(n).m - 1]++;
+  let num = 0, den = 0;
+  for (const y of years) {
+    const v = stats.years[String(y)]?.battery?.[String(k)]?.month;
+    if (!v) continue;
+    days.forEach((d, m) => { if (d && v[m] != null) { num += v[m] * d; den += d; } });
+  }
+  return den > 0 ? num / den : null;
+}
+
+// How the shape of a day has changed over the years, and what that did to capture rates.
+function curveHistory(stats, zone) {
+  const cc = curveCfg();
+  const ys = Object.keys(stats.years).map(Number).sort((a, b) => a - b);
+  const mon = Math.min(11, Math.max(0, (parseInt(cc.hmonth, 10) || 5) - 1));
+  const box = h("div", { class: "chart-box" });
+  const sel = h("select", { class: "select", "aria-label": "Month", onchange: (e) => { saveCurve({ hmonth: e.target.value }); render(); } },
+    MONTH_ABBR.map((l, i) => h("option", { value: String(i + 1), selected: i === mon || null }, l)));
+  // Four years at most, one hue from light (oldest) to dark: the first, one between, the last two.
+  const withData = ys.filter((y) => stats.years[String(y)].shape[mon][0].some((v) => v != null));
+  const pick = withData.length <= 4 ? withData
+    : [withData[0], withData[Math.floor((withData.length - 2) / 2)], withData[withData.length - 2], withData[withData.length - 1]];
+  const series = pick.map((y, i) => ({ name: stats.years[String(y)].full ? String(y) : `${y} so far`, color: SEQ(i), values: stats.years[String(y)].shape[mon][0] }));
+  requestAnimationFrame(() => {
+    if (!series.length) return;
+    lineChart(box, { x: [...Array(24).keys()], xFmt: (v) => `${String(Math.round(v)).padStart(2, "0")}:00`, xName: "", height: 190, rest: 13,
+      fmt: (v) => `${nf2.format(v)}×`, tickFmt: (v) => `${(+v).toFixed(1)}×`, series, label: `Weekday price shape in ${MONTH_ABBR[mon]}, by year` });
+    box.appendChild(legend(series.map((s) => ({ name: s.name, color: s.color }))));
+  });
+  const rows = ys.map((y) => {
+    const st = stats.years[String(y)];
+    const base = st.monthly.base.filter((v) => v != null);
+    const pk = st.monthly.peak.filter((v) => v != null);
+    const avg = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
+    return h("tr", null, h("th", { scope: "row", text: st.full ? String(y) : `${y} so far` }),
+      num(p1(avg(base))), num(signed(avg(pk) - avg(base), p1), "wide"),
+      num(st.capture?.solar?.rate_year != null ? pct(st.capture.solar.rate_year, 0) : "—"),
+      num(st.capture?.wind?.rate_year != null ? pct(st.capture.wind.rate_year, 0) : "—"),
+      num(st.battery?.["2"]?.year != null ? p1(st.battery["2"].year) : "—"));
+  });
+  return section("curve-history", kicker(`${ZONE_NAME[zone]}, from ENTSO-E history`), h("h2", { class: "h2", text: "How the shape of a day changed" }),
+    h("div", { class: "filters" }, h("label", { class: "inline-field" }, h("span", { text: "Month" }), sel)),
+    h("p", { class: "note", text: `The average weekday in that month, each hour as a multiple of the month's average price, for ${withData.length > 4 ? "four of the years" : "each year"}, from faint (oldest) to strong (newest). Watch midday sink as solar grows, and the evening rise to meet it.` }),
+    box,
+    table(["Year", "Base", h("th", { class: "wide", text: "Peak − base" }), "Solar", "Wind", "Battery"], rows, { caption: "Yearly averages" }),
+    h("p", { class: "note", text: "Base is the average of the monthly base prices, in €/MWh. Solar and wind are capture rates: the output-weighted price over the base price. Battery is what a 2-hour battery earned, in € per MW per day, cycling once a day with perfect foresight of day-ahead prices at 85% round trip: an upper bound for day-ahead arbitrage alone." }));
+}
+
 // ------------------------------------------------------------------ Options
 const YEAR_MS = 365 * 86400000;
 const OPT_DEFAULTS = {
@@ -1055,8 +1399,8 @@ function pushSection() {
       draw();
     };
     const copy = async (text) => { try { await navigator.clipboard.writeText(text); msg.textContent = "Copied."; } catch { msg.textContent = "Couldn't copy; select it by hand."; } };
-    body.replaceChildren(
-      h("p", { class: "muted" }, "Each brief run can send a short push through ntfy, a free notification app, with a link back here."),
+    body.replaceChildren(...[
+      h("p", { class: "muted" }, "The brief can send a short push through ntfy, a free notification app, with a link back here: at most two a day."),
       h("ol", { class: "steps" },
         h("li", null, "Install ntfy (", h("a", { href: NTFY_PLAY, target: "_blank", rel: "noopener" }, "Google Play"), " or ", h("a", { href: NTFY_IOS, target: "_blank", rel: "noopener" }, "App Store"), ")."),
         h("li", null, topic ? h("span", null, "Subscribe to this topic in the app: ", h("code", { class: "topic", text: topic })) : h("button", { type: "button", class: "btn small", onclick: gen }, "Make a private topic name")),
@@ -1064,7 +1408,7 @@ function pushSection() {
       topic ? h("div", { class: "row-btns" },
         h("button", { type: "button", class: "btn ghost", onclick: async () => { try { await sendPush(topic, "PowerApp test", "If you can read this, the brief's pushes will arrive too."); msg.textContent = "Sent. Check your phone."; } catch (e) { msg.textContent = e.message; } } }, "Send a test push"),
         h("button", { type: "button", class: "btn ghost", onclick: () => copy(topic) }, "Copy topic")) : null,
-      msg);
+      msg].filter(Boolean));   // replaceChildren would print a null as "null"
   };
   draw();
   return h("section", { class: "set-sec" }, h("h3", { class: "h3", text: "Phone pushes" }), body);
