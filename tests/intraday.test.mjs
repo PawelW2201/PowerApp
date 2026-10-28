@@ -34,6 +34,8 @@ for (const cs of fx.cases) {
     for (const [h, t, x, q] of cs.quotes) close(w.quote(h, t, x), q, `quote ${h} at ${t} in ${x}`);
     const r = simulate(w, b, { days: cs.days, seed: cs.seed });
     assert.deepEqual(r.dayAheadActions, cs.day_ahead_actions);
+    close(r.spread.day_ahead, cs.spread.day_ahead, "day-ahead spread");
+    close(r.spread.oracle, cs.spread.oracle, "oracle spread");
     for (const name of POLICIES) {
       for (const k of ["expected", "mean", "se", "p10", "p90", "traded"]) close(r.policies[name][k], cs.policies[name][k], `${name} ${k}`);
     }

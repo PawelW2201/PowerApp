@@ -32,7 +32,10 @@ how European power markets work on public data.
   away from day-ahead and spike when something breaks (all made up, fair on average). Four ways to run it on the
   same simulated days: keep the day-ahead schedule, re-plan every hour and trade at once (a rolling LP), trade each
   hour at its close with the optimal policy (a dynamic programme), or know every price in advance. The day comes
-  from your curve or is made up; you set the drift, the spikes, the trading cost and the grid fee on charging.
+  from your curve or is made up; you set the drift, the spikes, the trading cost and the grid fee on charging, and
+  it shows how much better the oracle buys and sells than day-ahead, to calibrate the spikes against a market you
+  know. Short spikes are what make waiting pay: a chart shows each way of trading as spikes get longer, bigger or
+  more frequent.
 
 This repository holds **only the app's code**. It contains no data: when you open Today, the app reads
 `summary.json` from the `dashboard-data` branch of your private PowerDesk repository, and Curve and RfQ read the

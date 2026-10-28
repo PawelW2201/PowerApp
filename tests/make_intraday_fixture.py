@@ -24,6 +24,8 @@ CASES = [
      dict(hours=2, round_trip=0.85, cycles=2, fee=14.13), 30, 13),
     ("one hour, a dear fee and costly trading", dict(sigma=12.0, phi=0.7, per_day=2.5, size=90.0, length=1.5, shape=0.6, cost=2.0),
      dict(hours=1, round_trip=0.9, cycles=2, fee=30.0), 25, 17),
+    ("big one-hour spikes, as the app's defaults", dict(sigma=8.0, phi=0.8, per_day=1.5, size=300.0, length=1.0, shape=0.8, cost=0.25),
+     dict(hours=2, round_trip=0.85, cycles=2, fee=14.13), 30, 7),
 ]
 
 
@@ -45,7 +47,7 @@ for name, wkw, bkw, days, seed in CASES:
         "days": days, "seed": seed,
         "drift": w.drift, "jump": w.jump, "comp": w.comp, "mean_id": w.mean_id, "quotes": quotes,
         "pd_row": w.pd[len(w.drift) // 2], "ps_row": w.ps[20][0],
-        "policies": r["policies"], "day_ahead_actions": r["day_ahead_actions"],
+        "policies": r["policies"], "day_ahead_actions": r["day_ahead_actions"], "spread": r["spread"],
         "example": {"intraday": ex["intraday"], "spike": ex["spike"], "actions": ex["actions"], "values": ex["values"]} if ex else None,
     })
 

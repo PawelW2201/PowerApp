@@ -7,7 +7,7 @@ import * as rfq from "./rfq.js";
 import * as idm from "./intraday.js";
 import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, dayNum, weekday, baseHours, isHoliday, zonedToUtc, parse, MONTH_ABBR } from "./calendar.js";
 
-const VERSION = "0.8.0";
+const VERSION = "0.9.0";
 const STORE = "powerapp.v1";
 const DATA_CACHE = "pa-data-v1";
 const DEFAULT_BRANCH = "dashboard-data";
@@ -1679,9 +1679,17 @@ function spreadSection() {
 // A battery in a made-up intraday market: committing early against waiting (intraday.js, a port of
 // PowerDesk's intraday.py). The day-ahead day comes from the Curve tab's curve or is made up; all of
 // intraday is a toy, on purpose.
+// Spikes big and short by default (300 €/MWh on average, an hour long): over a year of real days an oracle
+// with them buys and sells about 100 €/MWh a pair better than the day-ahead schedule, as where spikes are massive.
 const ID_DEFAULTS = { day: "curve", month: "", dt: "0", bh: "2", cycles: "2", rt: "85", sigma: "8", phi: "80", perDay: "1.5",
-  size: "100", length: "2", shape: "80", cost: "0.25", days: "500" };
-const idCfg = () => ({ ...ID_DEFAULTS, ...(cfg.intraday || {}) });
+  size: "300", length: "1", shape: "80", cost: "0.25", days: "2000", sweep: "length" };
+// Settings saved before these defaults (no `sweep` yet) that still hold the old defaults take the new ones.
+const ID_OLD_DEFAULTS = { size: "100", length: "2", cost: "2", days: "500" };
+const idCfg = () => {
+  const saved = { ...(cfg.intraday || {}) };
+  if (!("sweep" in saved)) for (const [k, v] of Object.entries(ID_OLD_DEFAULTS)) if (saved[k] === v) delete saved[k];
+  return { ...ID_DEFAULTS, ...saved };
+};
 const saveId = (patch) => saveCfg({ intraday: { ...idCfg(), ...patch } });
 const MADE_UP_DAY = [92, 86, 82, 81, 84, 93, 110, 112, 95, 70, 48, 38, 33, 30, 33, 45, 62, 88, 112, 140, 180, 150, 118, 104];
 const ID_POLICY = {
@@ -1690,9 +1698,20 @@ const ID_POLICY = {
   patient: { name: "Patient", sub: "trades each hour at its close", color: "var(--s-1)" },
   oracle: { name: "Oracle", sub: "knows every price in advance", color: "var(--s-3)" },
 };
-const ID_SWEEP = [0, 0.5, 1, 2, 3, 4];
+// What the chart under the results varies, everything else as set.
+const ID_SWEEPS = {
+  length: { key: "length", label: "Spike length", title: "As spikes last longer", values: [1, 1.5, 2, 3, 4], xTitle: "Spike length, hours",
+    fmt: (v) => `${upTo2.format(v)} h`,
+    note: "Short spikes are over before a plan made on expected prices can react: only a battery that kept energy and headroom catches them, and that's what waiting buys. Longer ones give the rolling LP time to re-plan into them, so the gap closes, while the oracle, catching every spike hour, gains." },
+  size: { key: "size", label: "Spike size", title: "As spikes get bigger", values: [0, 100, 200, 300, 450, 600], xTitle: "Average spike size, €/MWh",
+    fmt: (v) => `€${upTo2.format(v)}`,
+    note: "Bigger spikes are worth more to whoever catches them, and the patient trader catches more of them: the gap to the rolling LP widens with the size." },
+  perDay: { key: "perDay", label: "Spikes a day", title: "As spikes get more frequent", values: [0, 0.5, 1, 2, 3, 4], xTitle: "Spikes a day",
+    fmt: (v) => upTo2.format(v),
+    note: "With no spikes there's little to wait for: the drift alone is mostly captured by re-planning. Each spike is a chance the patient trader keeps energy and headroom for, and the rolling LP has often committed away." },
+};
 const ID_DAYTYPES = [{ value: "0", label: "Weekday" }, { value: "1", label: "Saturday" }, { value: "2", label: "Sunday, holiday" }];
-const idMemo = { curveKey: null, cv: null, key: null, result: null, sweepKey: null, sweep: null, run: 0 };
+const idMemo = { curveKey: null, cv: null, key: null, result: null, sweeps: new Map(), run: 0 };
 const hourLabel = (v) => `${String(Math.round(v)).padStart(2, "0")}:00`;
 
 // One day of the curve: the first day of the month with that day type and 24 hours.
@@ -1774,7 +1793,7 @@ function viewIntraday() {
       cost: clamp(numOr(c.cost, 0.25), 0, 1000) };
     const bat = { hours: [1, 2, 4].includes(+c.bh) ? +c.bh : 2, roundTrip: clamp(numOr(c.rt, 85) / 100, 0.5, 1), cycles: c.cycles === "1" ? 1 : 2,
       fee: gridFee(zone) };
-    return { opts, bat, days: Math.round(clamp(numOr(c.days, 500), 50, 5000)) };
+    return { opts, bat, days: Math.round(clamp(numOr(c.days, 2000), 50, 20000)) };
   }
 
   function compute() {
@@ -1805,21 +1824,27 @@ function viewIntraday() {
     const exNote = ex ? `That day the patient trader made ${eur(ex.values.patient)} and the rolling LP ${eur(ex.values.rolling)}; the oracle ${eur(ex.values.oracle)} and day-ahead ${eur(ex.values.day_ahead)}.` +
       (same ? " Both ended the day doing the same, at different prices: the rolling LP made its changes as soon as it re-planned, at the quotes of the moment, the patient trader at each hour's close." : "") : "";
     const strip = ex ? actionStrip(ex.actions, ["rolling", "patient", "oracle"]) : null;
+    const sp = r.spread, edge = sp && sp.oracle != null && sp.day_ahead != null ? sp.oracle - sp.day_ahead : null;
+    const sw = ID_SWEEPS[idCfg().sweep] || ID_SWEEPS.length;
     out.replaceChildren(
       h("div", { class: "rfq-block" },
         h("div", { class: "stats" }, ...idm.POLICIES.map((k) => stat(ID_POLICY[k].name, eur(P[k].expected), `a day per MW: ${ID_POLICY[k].sub}`))),
-        h("p", { class: "lede", text: `Waiting is worth ${signed(wait, eur)} a day per MW over the rolling LP (${pct(wait / P.rolling.expected, 1)}). Hindsight would add another ${eur(hind)}: no way of trading gets near the oracle.` }),
+        h("p", { class: "lede", text: `Waiting is worth ${signed(wait, eur)} a day per MW over the rolling LP (${pct(wait / P.rolling.expected, 1)}). Hindsight would add another ${eur(hind)}, which no way of trading can have.` }),
         table(["", "€ per MW a day", "Over day-ahead", h("th", { class: "wide", text: "Most days (10th–90th)" }), "MWh traded"], rows, { cls: "wrap", caption: "The four ways of trading, on the same simulated days" }),
-        h("p", { class: "note", text: `On ${int(days)} simulated days of a ${bat.hours}-hour battery, at most ${bat.cycles} cycle${bat.cycles > 1 ? "s" : ""} a day. The patient trader's value is exact (its programme's own); the others are averages of the simulated days, give or take ${eur(2 * P.rolling.se)} for the rolling LP and ${eur(2 * P.oracle.se)} for the oracle.` })),
+        h("p", { class: "note", text: `On ${int(days)} simulated days of a ${bat.hours}-hour battery, at most ${bat.cycles} cycle${bat.cycles > 1 ? "s" : ""} a day. The patient trader's value is exact (its programme's own); the others are averages of the simulated days, give or take ${eur(2 * P.rolling.se)} for the rolling LP and ${eur(2 * P.oracle.se)} for the oracle.` }),
+        edge != null ? h("p", { class: "note" }, h("strong", { text: "Calibration. " }),
+          `On a buy-sell pair the oracle does ${p2(edge)} €/MWh better than the day-ahead schedule here: it sells ${p2(sp.oracle)} €/MWh above where it buys, day-ahead ${p2(sp.day_ahead)}. Spikes are what this toy knows least about, so if you know that figure for your market, tune the spike size and length until the toy matches it. It's one day's figure: a market's averages many days, and a day whose day-ahead spread is already wide shows less.`) : null),
       ex ? h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: "The day waiting paid most" }), dayBox, strip,
         legend([{ name: "Charge (buy)", color: "var(--s-hist)", dot: true }, { name: "Discharge (sell)", color: "var(--ink-2)", dot: true }]),
         h("p", { class: "note", text: exNote })) : null,
-      h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: "As spikes get more frequent" }), sweepBox),
+      h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: sw.title }),
+        seg("Vary", Object.values(ID_SWEEPS).map((s) => ({ value: s.key, label: s.label })), sw.key, (v) => { saveId({ sweep: v }); render(); }),
+        sweepBox),
       h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: "How the toy works" }),
         h("p", { class: "note", text: "Each hour's final intraday price is its day-ahead price plus a drift that carries on from hour to hour (forecasts going wrong) and spikes, which mostly go the way of the day: up in its dear half, down in its cheap half. Before an hour closes, the market quotes it at its expected final price, and on average intraday equals day-ahead, so whatever a way of trading earns beyond day-ahead comes from using what it learns, not from a bias." }),
         h("p", { class: "note", text: `All four sell the day-ahead schedule in the auction. Every MWh traded in intraday after that costs the trading cost${bat.fee > 0 ? `, and every MWh each ends up charging pays ${zone}'s grid fee, ${p2(bat.fee)} €/MWh, however it was bought` : ""}. The rolling LP plans the rest of the day every hour on the quotes and trades the plan at once, changing it only when the new plan beats the old by more than the trades cost. The patient trader waits and trades each hour at its close, choosing by a dynamic programme that knows how the world moves: it holds energy and headroom while the chance of a better price later is worth more than the spread on offer now.` }),
-        h("p", { class: "note", text: "With free trading the rolling LP gets nearly what the patient trader gets: committing early only costs what changing its mind costs, and that's nothing. Make trading cost something, or spikes common, and the gap opens. Most of the oracle's lead is hindsight." }),
-        h("p", { class: "note", text: "A toy: one day, whole hours, whole MWh, as much liquidity as it wants at the quoted price, and the same seeded draw of days every time." })));
+        h("p", { class: "note", text: "Re-planning every hour catches the drift and long spikes almost as well as waiting does, the more so when trading is free. Short spikes are different: they're over before a plan made on expected prices can react, so only a battery that kept energy and headroom in reserve catches them. That's what waiting is worth, and trading costs only add to it. The rest of the oracle's lead is hindsight." }),
+        h("p", { class: "note", text: "A toy: one day, whole hours (so no spike is shorter than an hour), whole MWh, as much liquidity as it wants at the quoted price, and the same seeded draw of days every time." })));
     requestAnimationFrame(() => {
       if (ex && dayBox.isConnected) {
         lineChart(dayBox, { x: da.map((_, i) => i), xFmt: hourLabel, xName: "", fmt: p2, tickFmt: tick, height: 180, zero: true,
@@ -1828,34 +1853,38 @@ function viewIntraday() {
         dayBox.appendChild(legend([{ name: "Day-ahead", color: "var(--s-hist)" }, { name: "Intraday, final", color: "var(--ink-2)" }]));
       }
     });
-    sweepLater({ opts, bat, run, sweepBox });
+    sweepLater({ opts, bat, run, sweepBox, sw });
   }
 
-  // each policy against spikes a day, a point at a time after the page is drawn
-  function sweepLater({ opts, bat, run, sweepBox }) {
-    const days = 200, key = JSON.stringify([da, { ...opts, perDay: null }, bat, days]);
+  // each policy against one spike setting (`sw`), a point at a time after the page is drawn
+  function sweepLater({ opts, bat, run, sweepBox, sw }) {
+    const days = 1000, key = JSON.stringify([sw.key, da, { ...opts, [sw.key]: null }, bat, days]);
     const draw = (rows) => {
       if (run !== idMemo.run || !sweepBox.isConnected) return;
       sweepBox.replaceChildren();
       const series = idm.POLICIES.map((k) => ({ name: ID_POLICY[k].name, values: rows.map((r) => r[k]), color: ID_POLICY[k].color }));
-      lineChart(sweepBox, { x: rows.map((r) => r.per_day), xFmt: (v) => upTo2.format(v), xName: "Spikes a day", fmt: eur, tickFmt: (v) => `€${tick(v)}`,
-        height: 190, series, xTitle: "Spikes a day", rest: opts.perDay, marks: [{ x: opts.perDay, label: "yours" }],
-        label: "Value of each way of trading against how many spikes a day, € per MW a day" });
+      lineChart(sweepBox, { x: rows.map((r) => r.x), xFmt: sw.fmt, xName: sw.label, fmt: eur, tickFmt: (v) => `€${tick(v)}`,
+        height: 190, series, xTitle: sw.xTitle, rest: opts[sw.key], marks: [{ x: opts[sw.key], label: "yours" }],
+        label: `Value of each way of trading against ${sw.label.toLowerCase()}, € per MW a day` });
       sweepBox.appendChild(legend(series.map((x) => ({ name: x.name, color: x.color }))));
-      sweepBox.appendChild(h("p", { class: "note", text: `€ per MW a day, everything else as set, on ${days} simulated days per point. With no spikes there's little to wait for: the drift alone is mostly captured by re-planning. Each spike is a chance the patient trader keeps energy and headroom for, and the rolling LP has often committed away.` }));
+      sweepBox.appendChild(h("p", { class: "note", text: `€ per MW a day, everything else as set, on ${days} simulated days per point. ${sw.note}` }));
     };
-    if (idMemo.sweepKey === key && idMemo.sweep) return requestAnimationFrame(() => draw(idMemo.sweep));
-    sweepBox.replaceChildren(h("p", { class: "note", text: "Working out the other spike rates…" }));
+    if (idMemo.sweeps.has(key)) { const hit = idMemo.sweeps.get(key); return requestAnimationFrame(() => draw(hit)); }
+    sweepBox.replaceChildren(h("p", { class: "note", text: "Working out the other settings…" }));
     const b = idm.battery(bat), rows = [];
     const step = () => {
       if (run !== idMemo.run) return;
-      const f = ID_SWEEP[rows.length];
+      const f = sw.values[rows.length];
       try {
-        const r = idm.simulate(idm.world(da, { ...opts, perDay: f }), b, { days, seed: 7 });
-        rows.push({ per_day: f, ...Object.fromEntries(idm.POLICIES.map((k) => [k, r.policies[k].expected])) });
+        const r = idm.simulate(idm.world(da, { ...opts, [sw.key]: f }), b, { days, seed: 7 });
+        rows.push({ x: f, ...Object.fromEntries(idm.POLICIES.map((k) => [k, r.policies[k].expected])) });
       } catch (e) { sweepBox.replaceChildren(h("p", { class: "warn-text", text: e.message })); return; }
-      if (rows.length < ID_SWEEP.length) setTimeout(step, 0);
-      else { idMemo.sweepKey = key; idMemo.sweep = rows; draw(rows); }
+      if (rows.length < sw.values.length) setTimeout(step, 0);
+      else {
+        idMemo.sweeps.set(key, rows);
+        if (idMemo.sweeps.size > 6) idMemo.sweeps.delete(idMemo.sweeps.keys().next().value);
+        draw(rows);
+      }
     };
     setTimeout(step, 0);
   }

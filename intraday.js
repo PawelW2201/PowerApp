@@ -16,6 +16,11 @@
 // more than what the trades cost. The patient trader trades each hour only when it closes, choosing by
 // a dynamic programme over the hour, the charge, the cycles used and the state of the world. The oracle
 // knows every final price in advance.
+//
+// Drift and long spikes, re-planning catches almost as well as waiting. Short spikes are over before a
+// plan made on expected prices can react: only a battery that kept energy and headroom catches them,
+// even when trading is free. Spikes are what the toy knows least about, so `simulate` also reports the
+// buy-sell spread of the day-ahead schedule and of the oracle, to tune the spikes against a market's.
 const IDLE = 0, CHARGE = 1, DISCHARGE = 2, TOL = 1e-9, NEG = -Infinity;
 export const POLICIES = ["day_ahead", "rolling", "patient", "oracle"];
 export const ACTIONS = { IDLE, CHARGE, DISCHARGE };
@@ -292,6 +297,15 @@ export function rollingDay(w, b, xs, daActs) {
   return [cash, traded, pos];
 }
 
+// [sum of prices sold at, hours sold, sum of prices bought at, hours bought] -> average sold at less
+// average bought at (EUR/MWh); null without both.
+const spreadOf = (s) => (s[1] && s[3] ? s[0] / s[1] - s[2] / s[3] : null);
+function addSides(s, acts, prices) {
+  for (let h = 0; h < acts.length; h++) {
+    if (acts[h] === DISCHARGE) { s[0] += prices[h]; s[1] += 1; } else if (acts[h] === CHARGE) { s[2] += prices[h]; s[3] += 1; }
+  }
+}
+
 function pct(xs, q) {
   const s = xs.slice().sort((a, b) => a - b), pos = q * (s.length - 1), lo = Math.floor(pos), hi = Math.min(lo + 1, s.length - 1);
   return s[lo] + (s[hi] - s[lo]) * (pos - lo);
@@ -299,7 +313,9 @@ function pct(xs, q) {
 
 // The four policies on the same simulated days (EUR per MW). Each settles its day-ahead schedule at
 // day-ahead prices and every change at intraday prices, less trading costs, and pays the grid fee on
-// what it ends up charging. `pat` reuses a solved patient policy for the same world and battery.
+// what it ends up charging. `spread`: the buy-sell spread the day-ahead schedule gets at day-ahead
+// prices and the oracle at final prices, to calibrate the spikes against. `pat` reuses a solved
+// patient policy for the same world and battery.
 export function simulate(w, b, { days = 1000, seed = 7, pat = null } = {}) {
   const n = w.da.length, { ns, nd } = w;
   const daActs = bestPath(w.da, b), ref = daActs.map((a) => b.grid(a));
@@ -309,6 +325,8 @@ export function simulate(w, b, { days = 1000, seed = 7, pat = null } = {}) {
   const [patActs, patReward] = pat || patient(w, b, ref);
   const rnd = rng(seed);
   const pl = Object.fromEntries(POLICIES.map((k) => [k, []])), vol = Object.fromEntries(POLICIES.map((k) => [k, []]));
+  const daSides = [0.0, 0, 0.0, 0], orSides = [0.0, 0, 0.0, 0];
+  addSides(daSides, daActs, w.da);
   let bestGap = NEG, example = null;
   for (let day = 0; day < days; day++) {
     let i = Math.floor(nd / 2), k = 0;
@@ -321,6 +339,7 @@ export function simulate(w, b, { days = 1000, seed = 7, pat = null } = {}) {
     let soc = 0, dis = 0;
     acts.patient = xs.map((x, h) => { const a = patActs[h][b.idx(soc, dis)][x]; [soc, dis] = step(a, soc, dis); return a; });
     acts.oracle = bestPath(ida, b, 0, 0, 0, ref, w.cost);
+    addSides(orSides, acts.oracle, ida);
     const vals = { day_ahead: daVal, rolling: daVal + cash };
     vol.day_ahead.push(0.0); vol.rolling.push(traded);
     for (const name of ["patient", "oracle"]) {
@@ -344,7 +363,7 @@ export function simulate(w, b, { days = 1000, seed = 7, pat = null } = {}) {
   out.patient.expected = daCash - exp + patReward;          // the programme's reward already carries its fees
   out.rolling.expected = out.rolling.mean;
   out.oracle.expected = out.oracle.mean;
-  return { policies: out, days, example, dayAheadActions: daActs };
+  return { policies: out, days, example, dayAheadActions: daActs, spread: { day_ahead: spreadOf(daSides), oracle: spreadOf(orSides) } };
 }
 
 // Each policy's value as spikes get more frequent, everything else as set.
