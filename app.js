@@ -6,7 +6,7 @@ import * as crv from "./curve.js";
 import * as rfq from "./rfq.js";
 import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, dayNum, weekday, baseHours, isHoliday, zonedToUtc, parse, MONTH_ABBR } from "./calendar.js";
 
-const VERSION = "0.5.1";
+const VERSION = "0.5.2";
 const STORE = "powerapp.v1";
 const DATA_CACHE = "pa-data-v1";
 const DEFAULT_BRANCH = "dashboard-data";
@@ -1170,7 +1170,7 @@ function viewRfq() {
           const f = rfq.floorValue(rfqMemo.months, { ...terms, floor: clamp(numOr(c.floorPct, 70) / 100, 0, 2),
             vol_year: clamp(numOr(c.volYear, 25) / 100, 0, 3), vol_drift: clamp(numOr(c.volDrift, 10) / 100, 0, 3),
             cap: clamp(numOr(c.capPct, 100) / 100, 0, 10), margin: clamp(numOr(c.floorMargin, 15) / 100, 0, 5) });
-          const kids = floorResult(f, { mw: numOr(c.bessMw, 50), margin: numOr(c.floorMargin, 15) / 100, assumed, cv });
+          const kids = floorResult(f, { mw: numOr(c.bessMw, 50), hours, margin: numOr(c.floorMargin, 15) / 100, assumed, cv });
           out.replaceChildren(...kids.nodes);
           kids.draw();
         } else {
@@ -1250,9 +1250,9 @@ function tollResult(r, { mw, hours, cycles, assumed, cv, stats }) {
   const kids = [
     h("div", { class: "rfq-block" },
       h("div", { class: "stats" },
-        stat("Toll offer", eur(r.offer), "per MW a year"),
+        stat("Toll offer", eur(r.offer), `a year for 1 MW / ${hours} MWh`),
         stat("Per day", eur(r.offer / 365), "per MW"),
-        stat("For the project", eur(r.offer * mw), `a year, ${upTo2.format(mw)} MW`),
+        stat("For the project", eur(r.offer * mw), `a year, ${upTo2.format(mw)} MW / ${upTo2.format(mw * hours)} MWh`),
         stat("Intrinsic share", pct(r.intrinsic / r.spot, 0), "of perfect foresight"),
         stat("Cycles a day", r.cycles_per_day != null ? p2(r.cycles_per_day) : "—", `of ${cycles} allowed`)),
       h("h2", { class: "h2", text: "From intrinsic value to offer" }), box,
@@ -1272,7 +1272,7 @@ function tollResult(r, { mw, hours, cycles, assumed, cv, stats }) {
 
 // A revenue floor: one put a year on the battery's revenue. Returns the nodes and a draw() for the chart,
 // which needs to be in the page to measure its width.
-function floorResult(f, { mw, margin, assumed, cv }) {
+function floorResult(f, { mw, hours, margin, assumed, cv }) {
   const E = f.expected, F = f.level, C = f.cap_level;
   const shareOk = f.share != null && f.share <= 1;
   const janStart = ymd(f.start).m === 1;
@@ -1286,9 +1286,9 @@ function floorResult(f, { mw, margin, assumed, cv }) {
   const nodes = [
     h("div", { class: "rfq-block" },
       h("div", { class: "stats" },
-        stat("Floor", eur(F), `per MW a year, ${pct(E > 0 ? F / E : 0, 0)} of ${eur(E)} expected`),
+        stat("Floor", eur(F), `a year for 1 MW / ${hours} MWh, ${pct(E > 0 ? F / E : 0, 0)} of ${eur(E)} expected`),
         stat("Fair fee", eur(f.fair_fee), "a year: the strip of puts"),
-        stat("Fee offer", eur(f.fee), `a year with ${pct(margin, 0)} margin; ${eur(f.fee * mw)} for ${upTo2.format(mw)} MW`),
+        stat("Fee offer", eur(f.fee), `a year with ${pct(margin, 0)} margin; ${eur(f.fee * mw)} for ${upTo2.format(mw)} MW / ${upTo2.format(mw * hours)} MWh`),
         stat("Chance it pays", pct(f.chance, 0), "in an average year"),
         shareStat),
       h("h2", { class: "h2", text: "What the floor pays you, net" }), box,
