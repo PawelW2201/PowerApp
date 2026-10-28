@@ -16,9 +16,12 @@ how European power markets work on public data.
   Below, how the shape of a day and capture rates changed from 2019 on.
 - **RfQ** prices a deal against that curve: a pay-as-produced solar or wind PPA as a bridge from the base price to
   an offer in €/MWh, or a battery toll from intrinsic value to an offer in €/MW a year. Each history year is a
-  scenario, so you also see how much the deal moves from one kind of year to another. The same battery can carry a
-  revenue floor instead: a put on each year's revenue, priced with Black-76, with the fee, the chance it pays, and
-  the share of upside that would pay for it instead (a zero-cost collar).
+  scenario, so you also see how much the deal moves from one kind of year to another. The battery's cycle limit is
+  the contract's average a day over each contract year (1 to 2), with the offer for every limit side by side, and
+  its size matters: its own trades move the price against it (an impact estimated from the zone's history), so a
+  chart shows € per MW falling as the battery grows. The same battery can carry a revenue floor instead: a put on
+  each year's revenue, priced with Black-76, with the fee, the chance it pays, and the share of upside that would
+  pay for it instead (a zero-cost collar).
 - **Options** works on its own too: options on a future (Black-76 or Bachelier, greeks, implied vol, value against
   the future), an average-price option on a delivery month priced both as a European on the month future and
   as an Asian on the daily fixings (moment matching and Monte Carlo, on a two-factor forward model), and a

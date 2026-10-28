@@ -85,11 +85,15 @@ for name, mode, start, months, growth, kind, args in [
     ("ppa wind, months without history", "multiplicative", dt.date(2027, 1, 1), 15, 0.02, "ppa",
      dict(kind="wind", yield_mwh=2200, degradation=0.005, trend=-0.01, discount=0.05, risk=1.5, margin=1.0)),
     ("toll 2h one cycle", "multiplicative", dt.date(2027, 4, 1), 3, 0.0, "toll",
-     dict(hours=2, cycles=1, discount=0.05)),
-    ("toll 1h two cycles, months without history", "multiplicative", dt.date(2027, 1, 1), 15, 0.02, "toll",
-     dict(hours=1, cycles=2, availability=0.95, degradation=0.02, realism=0.6, other=5000.0, trend=-0.02, risk=0.12,
+     dict(hours=2, cycles=1.0, discount=0.05)),
+    ("toll 1h 1.3 cycles, months without history", "multiplicative", dt.date(2027, 1, 1), 15, 0.02, "toll",
+     dict(hours=1, cycles=1.3, availability=0.95, degradation=0.02, realism=0.6, other=5000.0, trend=-0.02, risk=0.12,
           margin=0.04, discount=0.05)),
-    ("toll 4h, beyond the quotes", "additive", dt.date(2028, 7, 1), 24, 0.03, "toll", dict(hours=4, cycles=1)),
+    ("toll 4h two cycles, beyond the quotes", "additive", dt.date(2028, 7, 1), 24, 0.03, "toll", dict(hours=4, cycles=2.0)),
+    ("toll 2h 1.5 cycles, 300 MW moving the price", "multiplicative", dt.date(2027, 1, 1), 15, 0.0, "toll",
+     dict(hours=2, cycles=1.5, mw=300.0, impact=0.12, discount=0.05)),
+    ("toll 1h 1.1 cycles, 1 GW, beyond the quotes", "additive", dt.date(2028, 1, 1), 12, 0.02, "toll",
+     dict(hours=1, cycles=1.1, mw=1000.0, impact=0.08, round_trip=0.9, other=3000.0)),
 ]:
     cv, assumed = rfq.tenor_curve(QUOTES, "DE", STATS, YEARS, mode, start, months, growth)
     floors = []
@@ -98,7 +102,7 @@ for name, mode, start, months, growth, kind, args in [
     else:
         res = rfq.toll(cv, DOCS, YEARS, start=start, months=months, today=TODAY, **args)
         # the same battery under a revenue floor instead of a toll
-        tech = {k: args[k] for k in ("hours", "round_trip", "cycles") if k in args}
+        tech = {k: args[k] for k in ("hours", "round_trip", "cycles", "mw", "impact") if k in args}
         terms = {k: v for k, v in args.items() if k not in tech and k not in ("risk", "margin")}
         tm = rfq.toll_months(cv, DOCS, YEARS, start=start, months=months, today=TODAY, **tech)
         for fa in (dict(floor=0.7, vol_year=0.25, vol_drift=0.1, cap=1.0, margin=0.15),
@@ -111,12 +115,19 @@ for name, mode, start, months, growth, kind, args in [
 
 rnd = random.Random(11)
 days = [[round(rnd.uniform(-60, 220), 2) for _ in range(24)] for _ in range(12)]
-battery = [{"prices": p, "hours": k, "cycles": c, "out": list(rfq.battery_dp(p, k, 0.85, c))}
-           for p in days for k, c in ((1, 1), (2, 1), (2, 2), (4, 1))]
+battery = [{"prices": p, "hours": k, "cycles": c, "impact": d, "out": list(rfq.battery_dp(p, k, 0.85, c, d)),
+            "curve": [None if v == float("-inf") else v for v in rfq.battery_curve(p, k, 0.85, d)],
+            "steps": [list(x) for x in rfq.day_steps(rfq.battery_curve(p, k, 0.85, d))]}
+           for p in days for k, c, d in ((1, 1, 0.0), (2, 1, 0.0), (2, 2, 0.0), (4, 1, 0.0), (2, 2, 7.5), (1, 2, 40.0))]
+cv_s, _ = rfq.tenor_curve(QUOTES, "DE", STATS, YEARS, "multiplicative", dt.date(2027, 4, 1), 3, 0.0)
+sizes = {"args": dict(start="2027-04-01", months=3, hours=2, cycles=1.2, impact=0.1, sizes=[0.0, 100.0, 500.0, 1000.0],
+                      risk=0.1, margin=0.05, discount=0.05),
+         "result": rfq.toll_sizes(cv_s, DOCS, YEARS, sizes=[0.0, 100.0, 500.0, 1000.0], start=dt.date(2027, 4, 1), months=3,
+                                  hours=2, cycles=1.2, impact=0.1, today=TODAY, risk=0.1, margin=0.05, discount=0.05)}
 hm = rfq.history_months(DOCS, "DE", "solar")[(2025, 5)]
 months_check = {"key": "2025-5", "days": len(hm.days), "mean": hm.mean, "daytypes": [d.daytype for d in hm.days],
                 "gen0": hm.days[0].gen[:24]}
 json.dump({"today": TODAY.isoformat(), "years": YEARS, "quotes": [{"product": q.product, "base": q.base, "peak": q.peak} for q in QUOTES],
            "stats": STATS, "docs": {str(y): d for y, d in DOCS.items()}, "cases": cases, "battery": battery,
-           "history": months_check}, sys.stdout, separators=(",", ":"))
+           "sizes": sizes, "history": months_check}, sys.stdout, separators=(",", ":"))
 print()

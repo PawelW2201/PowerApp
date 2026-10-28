@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { tenorCurve, ppa, toll, tollMonths, floorValue, batteryDp, historyMonths } from "../rfq.js";
+import { tenorCurve, ppa, toll, tollMonths, tollSizes, floorValue, batteryDp, batteryCurve, daySteps, historyMonths } from "../rfq.js";
 import { parseIso, isoDate } from "../calendar.js";
 
 const fx = JSON.parse(readFileSync(new URL("./rfq-fixture.json", import.meta.url)));
@@ -38,12 +38,15 @@ for (const cs of fx.cases) {
       r.years.forEach((y, i) => { for (const k of ["year", "months", "base", "rate_curve", "rate", "rate_min", "rate_max", "fair"]) close(y[k], e.years[i][k], `year ${y.year} ${k}`); });
     } else {
       close(r.spot, e.spot, "spot"); close(r.intrinsic, e.intrinsic, "intrinsic"); close(r.cycles_per_day, e.cycles_per_day, "cycles");
+      close(r.value, e.value, "value"); close(r.shadow, e.shadow, "shadow");
+      assert.equal(r.by_cycles.length, e.by_cycles.length);
+      r.by_cycles.forEach((b, i) => { for (const k of ["cycles", "value", "offer", "cycles_per_day"]) close(b[k], e.by_cycles[i][k], `${b.cycles} cycles ${k}`); });
       r.years.forEach((y, i) => {
         assert.equal(isoDate(y.from), e.years[i].from);
         for (const k of ["months", "intrinsic", "spot", "spot_min", "spot_max", "net"]) close(y[k], e.years[i][k], `year ${e.years[i].from} ${k}`);
       });
       // the same battery under a revenue floor
-      const tech = { hours: o.hours, round_trip: o.round_trip, cycles: o.cycles };
+      const tech = { hours: o.hours, round_trip: o.round_trip, cycles: o.cycles, mw: o.mw, impact: o.impact };
       Object.keys(tech).forEach((k) => tech[k] === undefined && delete tech[k]);
       const tm = tollMonths(cv, docs, fx.years, { start, months: cs.months, today, ...tech });
       for (const fl of cs.floors) {
@@ -59,12 +62,28 @@ for (const cs of fx.cases) {
   });
 }
 
-test("battery dispatch", () => {
+test("battery dispatch, revenue by MWh and its steps", () => {
   for (const b of fx.battery) {
-    const [v, used] = batteryDp(b.prices, b.hours, 0.85, b.cycles);
-    close(v, b.out[0], `battery ${b.hours}h x${b.cycles}`, 1e-12);
+    const where = `battery ${b.hours}h x${b.cycles} impact ${b.impact}`;
+    const [v, used] = batteryDp(b.prices, b.hours, 0.85, b.cycles, b.impact);
+    close(v, b.out[0], where, 1e-12);
     assert.equal(used, b.out[1]);
+    const c = batteryCurve(b.prices, b.hours, 0.85, b.impact);
+    assert.equal(c.length, b.curve.length);
+    c.forEach((x, q) => (b.curve[q] == null ? assert.equal(x, -Infinity) : close(x, b.curve[q], `${where} q=${q}`, 1e-12)));
+    const st = daySteps(c);
+    assert.equal(st.length, b.steps.length, where);
+    st.forEach(([q, x], i) => { assert.equal(q, b.steps[i][0]); close(x, b.steps[i][1], `${where} step ${i}`, 1e-12); });
   }
+});
+
+test("the toll as the battery grows", () => {
+  const a = fx.sizes.args, start = parseIso(a.start);
+  const { cv } = tenorCurve(fx.quotes, "DE", fx.stats, fx.years, "multiplicative", start, a.months, 0.0);
+  const r = tollSizes(cv, docs, fx.years, { ...a, start, today });
+  assert.equal(r.length, fx.sizes.result.length);
+  r.forEach((x, i) => { assert.equal(x.mw, fx.sizes.result[i].mw); close(x.value, fx.sizes.result[i].value, `value ${x.mw}`); close(x.offer, fx.sizes.result[i].offer, `offer ${x.mw}`); });
+  for (let i = 1; i < r.length; i++) assert.ok(r[i].offer < r[i - 1].offer, "a bigger battery earns less per MW");
 });
 
 test("history by month, with local hours", () => {

@@ -11,8 +11,14 @@
 // PPA (pay as produced): base over the tenor -> seasons -> daily shape on the curve -> weather ->
 // negative hours (if curtailed) -> capture-rate trend -> balancing -> risk -> margin = offer.
 // Toll (EUR/MW/year): intrinsic (the curve's daily shape) -> extrinsic (history's daily swings) ->
-// the share of it trading won't capture -> availability -> degradation -> spread trend -> other
-// revenue -> risk -> margin = offer. Both levelized with a discount rate, monthly, mid-month.
+// the share of it trading won't capture -> own price impact -> availability -> degradation ->
+// spread trend -> other revenue -> risk -> margin = offer. Both levelized with a discount rate,
+// monthly, mid-month.
+// Cycles: the contract's limit is an average a day over each contract year, at most two in any one
+// day. Each day's best revenue is known for every whole MWh discharged, so a year's budget goes to
+// the steps up those revenue curves, best first (a Lagrangian; the last step is the shadow price).
+// Size: the battery's own trades move the price against it, by `impact` (a share of the month's
+// base price per GW of its power, estimated from history by PowerDesk) at its full power.
 // Revenue floor: the provider pays max(F - R, 0) after a year whose revenue R ends below F, a put
 // on R. R is lognormal around the toll's expected revenue with log variance vol_year^2 (a year's
 // own surprise) + vol_drift^2 (t_start + T/3) (the level's drift, earned through the year like an
@@ -36,30 +42,84 @@ const tau = (month, today) => (month + 14 - today) / 365.25;
 const monthLabel = (n) => { const { y, m } = ymd(n); return `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][m - 1]}-${String(y % 100).padStart(2, "0")}`; };
 
 // ------------------------------------------------------------------ the battery
-// Best dispatch of a 1 MW battery holding `hours` MWh over one day, empty at the start and the
-// end, at most `cycles` full cycles, whole hours of 1 MWh. Charging 1 MWh buys 1/sqrt(rt) from
-// the grid, discharging sells sqrt(rt). Returns [EUR, MWh discharged]; never below zero (idle).
-export function batteryDp(prices, hours, roundTrip = 0.85, cycles = 1) {
-  const s = Math.sqrt(roundTrip), E = Math.trunc(hours), cap = Math.round(cycles * hours);
-  let V = [...Array(E + 1)].map(() => new Array(cap + 1).fill(-Infinity));
-  V[0][0] = 0.0;
-  for (const p of prices) {
-    const buy = p / s, sell = p * s;
-    const W = V.map((row) => row.slice());
-    for (let soc = 0; soc <= E; soc++) {
-      const row = V[soc];
-      for (let dis = 0; dis <= cap; dis++) {
-        const v = row[dis];
+export const DAILY_MAX = 2;                                 // full cycles in any one day (a usual warranty term)
+export const CYCLE_OPTIONS = [1.0, 1.1, 1.2, 1.3, 1.5, 2.0];  // average cycles a day, as RfQs ask for them
+
+// The best revenue of one day for each whole number q of MWh discharged, q = 0 to maxCycles x hours:
+// a 1 MW battery holding `hours` MWh, empty at the start and the end, 1 MWh an hour. Charging 1 MWh
+// buys 1/sqrt(rt) from the grid, discharging sells sqrt(rt); `impact` is how far its own full power
+// moves the price (EUR/MWh), so it sells that much lower and buys that much higher. -Infinity where
+// q can't be reached.
+let bufA = new Float64Array(0), bufB = new Float64Array(0);
+export function batteryCurve(prices, hours, roundTrip = 0.85, impact = 0.0, maxCycles = DAILY_MAX) {
+  const s = Math.sqrt(roundTrip), E = Math.trunc(hours), cap = Math.round(maxCycles * hours), w = cap + 1, size = (E + 1) * w;
+  if (bufA.length < size) { bufA = new Float64Array(size); bufB = new Float64Array(size); }
+  let V = bufA, W = bufB;
+  V.fill(-Infinity, 0, size);
+  V[0] = 0.0;
+  const n = prices.length;
+  for (let t = 0; t < n; t++) {
+    const p = prices[t], buy = p / s + impact / (s * s), sell = p * s - impact * (s * s);
+    // only states that can be reached by now and still end empty (the rest can't change the answer)
+    const socTop = Math.min(E, t, n - t), disTop = Math.min(cap, t >> 1);
+    W.set(V.subarray(0, size));                               // idle
+    for (let soc = 0; soc <= socTop; soc++) {
+      const row = soc * w;
+      for (let dis = 0; dis <= disTop; dis++) {
+        const v = V[row + dis];
         if (v === -Infinity) continue;
-        if (soc < E) { const w = v - buy; if (w > W[soc + 1][dis]) W[soc + 1][dis] = w; }
-        if (soc > 0 && dis < cap) { const w = v + sell; if (w > W[soc - 1][dis + 1]) W[soc - 1][dis + 1] = w; }
+        if (soc < E) { const x = v - buy, j = row + w + dis; if (x > W[j]) W[j] = x; }
+        if (soc > 0 && dis < cap) { const x = v + sell, j = row - w + dis + 1; if (x > W[j]) W[j] = x; }
       }
     }
-    V = W;
+    const tmp = V; V = W; W = tmp;
   }
+  return Array.from(V.subarray(0, w));
+}
+
+// The best day with at most `cycles` full cycles: [EUR, MWh discharged]; never below zero (idle).
+export function batteryDp(prices, hours, roundTrip = 0.85, cycles = 1, impact = 0.0) {
   let best = 0.0, used = 0;
-  for (let dis = 0; dis <= cap; dis++) if (V[0][dis] > best + 1e-12) { best = V[0][dis]; used = dis; }
+  batteryCurve(prices, hours, roundTrip, impact, cycles).forEach((v, q) => { if (v > best + 1e-12) { best = v; used = q; } });
   return [best, used];
+}
+
+// A day's revenue curve as steps up its upper concave hull from q = 0: [MWh, EUR], each worth less
+// per MWh than the one before; only steps worth more than nothing.
+export function daySteps(curve) {
+  const hull = [];
+  curve.forEach((v, q) => {
+    if (v === -Infinity) return;
+    while (hull.length >= 2) {
+      const [q0, v0] = hull[hull.length - 2], [q1, v1] = hull[hull.length - 1];
+      if ((v1 - v0) * (q - q0) <= (v - v0) * (q1 - q0)) hull.pop(); else break;
+    }
+    hull.push([q, v]);
+  });
+  const out = [];
+  for (let i = 1; i < hull.length; i++) {
+    const [q0, v0] = hull[i - 1], [q1, v1] = hull[i];
+    if (v1 - v0 <= 0) break;
+    out.push([q1 - q0, v1 - v0]);
+  }
+  return out;
+}
+
+// Spend a budget of MWh discharged on steps [EUR per MWh, MWh, EUR, slot], best first (`items` comes
+// sorted), the last one in part. Returns [Map slot -> [EUR, MWh], shadow price (0 if budget is left)].
+export function spend(items, budget) {
+  const got = new Map();
+  let left = budget, shadow = 0.0;
+  for (const [slope, mwh, eur, slot] of items) {
+    if (left <= 1e-9) { shadow = slope; break; }
+    const take = mwh <= left ? 1.0 : left / mwh;
+    if (!got.has(slot)) got.set(slot, [0.0, 0.0]);
+    const acc = got.get(slot);
+    acc[0] += take * eur; acc[1] += take * mwh;
+    left -= take * mwh;
+    if (take < 1.0) { shadow = slope; break; }
+  }
+  return [got, shadow];
 }
 
 // ------------------------------------------------------------------ history as scenarios
@@ -84,33 +144,44 @@ export function windSeries(doc, n) {
   return out;
 }
 
-// Map of "year-month" (month 1..12) -> { year, month, days: [{ daytype, price, gen, peak }], mean }
+// Map of "year-month" (month 1..12) -> { year, month, days: [{ daytype, price, gen, hour }], mean }. A year's
+// months are kept per document (time zones are slow to work out), so pricing again costs nothing.
+const histCache = new WeakMap();
 export function historyMonths(docs, marketCode, kind = null) {
   const mkt = getMarket(marketCode), out = new Map();
   for (const year of Object.keys(docs).map(Number).sort((a, b) => a - b)) {
-    const doc = docs[year], price = doc.price, n = price.length;
-    const gen = kind === "solar" ? (doc.solar || new Array(n).fill(null)) : kind === "wind" ? windSeries(doc, n) : new Array(n).fill(null);
-    const p0 = localParts(doc.start * 1000, mkt.tz);
-    const byMonth = new Map();
-    for (let day = dayNum(p0.y, p0.m, p0.d), i = 0; i < n; day++) {
-      const a = zonedToUtc(day, 0, mkt.tz) / 1000, b = zonedToUtc(day + 1, 0, mkt.tz) / 1000;
-      const cnt = Math.round((b - a) / 3600);
-      const d = { daytype: daytype(day), price: [], gen: [], hour: [] };
-      for (let j = 0; j < cnt && i < n; j++, i++) {
-        const h = cnt === 24 ? j : cnt === 23 ? (j < 2 ? j : j + 1) : (j < 3 ? j : j - 1);
-        d.price.push(price[i]); d.gen.push(i < gen.length ? gen[i] : null); d.hour.push(h);
-      }
-      const { y, m } = ymd(day);
-      if (!byMonth.has(`${y}-${m}`)) byMonth.set(`${y}-${m}`, { y, m, days: [] });
-      byMonth.get(`${y}-${m}`).days.push(d);
+    const doc = docs[year];
+    if (!histCache.has(doc)) histCache.set(doc, new Map());
+    const per = histCache.get(doc), key = `${mkt.code}|${kind}|${year}`;
+    if (!per.has(key)) per.set(key, monthsOfYear(doc, year, mkt, kind));
+    for (const [k, v] of per.get(key)) out.set(k, v);
+  }
+  return out;
+}
+
+function monthsOfYear(doc, year, mkt, kind) {
+  const price = doc.price, n = price.length, out = [];
+  const gen = kind === "solar" ? (doc.solar || new Array(n).fill(null)) : kind === "wind" ? windSeries(doc, n) : new Array(n).fill(null);
+  const p0 = localParts(doc.start * 1000, mkt.tz);
+  const byMonth = new Map();
+  for (let day = dayNum(p0.y, p0.m, p0.d), i = 0; i < n; day++) {
+    const a = zonedToUtc(day, 0, mkt.tz) / 1000, b = zonedToUtc(day + 1, 0, mkt.tz) / 1000;
+    const cnt = Math.round((b - a) / 3600);
+    const d = { daytype: daytype(day), price: [], gen: [], hour: [] };
+    for (let j = 0; j < cnt && i < n; j++, i++) {
+      const h = cnt === 24 ? j : cnt === 23 ? (j < 2 ? j : j + 1) : (j < 3 ? j : j - 1);
+      d.price.push(price[i]); d.gen.push(i < gen.length ? gen[i] : null); d.hour.push(h);
     }
-    for (const { y, m, days } of byMonth.values()) {
-      if (y !== year) continue;
-      let s = 0, c = 0;
-      for (const d of days) for (const p of d.price) if (p != null) { s += p; c++; }
-      if (!c || Math.abs(s / c) < MIN_MEAN) continue;
-      out.set(`${y}-${m}`, { year: y, month: m, days, mean: s / c });
-    }
+    const { y, m } = ymd(day);
+    if (!byMonth.has(`${y}-${m}`)) byMonth.set(`${y}-${m}`, { y, m, days: [] });
+    byMonth.get(`${y}-${m}`).days.push(d);
+  }
+  for (const { y, m, days } of byMonth.values()) {
+    if (y !== year) continue;
+    let s = 0, c = 0;
+    for (const d of days) for (const p of d.price) if (p != null) { s += p; c++; }
+    if (!c || Math.abs(s / c) < MIN_MEAN) continue;
+    out.push([`${y}-${m}`, { year: y, month: m, days, mean: s / c }]);
   }
   return out;
 }
@@ -152,7 +223,7 @@ export function dayGroups(cv, idx) {
 
 // Sum over the month's day groups of (days in the group) x (mean over history days of its day type
 // of each(day, peakHours)); a day type history lacks uses all its days.
-function byGroup(hm, groups, each, cols, complete = false) {
+function byGroup(hm, groups, each, cols) {
   const out = new Array(cols).fill(0.0);
   let seenAny = false;
   for (const [t, peakHours, n] of groups) {
@@ -160,7 +231,6 @@ function byGroup(hm, groups, each, cols, complete = false) {
     for (const pool of [hm.days.filter((d) => d.daytype === t), hm.days]) {
       acc = new Array(cols).fill(0.0); k = 0;
       for (const d of pool) {
-        if (complete && (d.price.length < 23 || d.price.some((p) => p == null))) continue;
         const r = each(d, peakHours);
         if (r == null) continue;
         for (let i = 0; i < cols; i++) acc[i] += r[i];
@@ -196,10 +266,35 @@ export function ppaMonth(hm, mo, curtail, groups) {
   return [w[0] / w[1], 1.0 - w[1] / w[2]];
 }
 
-export function tollMonth(hm, mo, groups, hours, roundTrip, cycles) {
-  const [sp, so] = scalers(hm, mo);
-  const each = (d, peakHours) => batteryDp(d.price.map((p, i) => (peakHours.has(d.hour[i]) ? sp(p) : so(p))), hours, roundTrip, cycles);
-  return byGroup(hm, groups, each, 2, true);
+// One scenario month as complete history days of prices on the curve's month `mo`, each with the
+// number of future days it stands for (a day type's days share its future days): [days, covered].
+export function historyDays(hm, mo, groups) {
+  const [sp, so] = scalers(hm, mo), out = [];
+  let covered = 0;
+  for (const [t, peakHours, n] of groups) {
+    let pool = [];
+    for (const cand of [hm.days.filter((d) => d.daytype === t), hm.days]) {
+      pool = cand.filter((d) => d.price.length >= 23 && d.price.every((p) => p != null));
+      if (pool.length) break;
+    }
+    if (!pool.length) continue;
+    covered += n;
+    const w = n / pool.length;
+    for (const d of pool) out.push([d.price.map((p, i) => (peakHours.has(d.hour[i]) ? sp(p) : so(p))), w]);
+  }
+  return [out, covered];
+}
+
+// A month of the curve as its distinct days: [hourly prices, how many days look like that, a key].
+export function curveDays(cv, idx) {
+  const days = new Map();
+  for (const i of idx) { if (!days.has(cv.day[i])) days.set(cv.day[i], []); days.get(cv.day[i]).push(cv.price[i]); }
+  const out = new Map();
+  for (const p of days.values()) {
+    const key = p.join(",");
+    if (out.has(key)) out.get(key)[1]++; else out.set(key, [p, 1, key]);
+  }
+  return [...out.values()];
 }
 
 // ------------------------------------------------------------------ the curve over the tenor
@@ -362,57 +457,133 @@ export function toll(cv, docs, years, o) {
   return tollValue(tollMonths(cv, docs, years, o), o);
 }
 
-// The slow part of a toll, which only the curve, the history, the tenor and the battery change:
-// per month, the intrinsic value and each scenario's, in EUR per MW.
-export function tollMonths(cv, docs, years, { start, months, hours = 2, round_trip = 0.85, cycles = 1, today }) {
+const poolCache = new WeakMap(), POOLS_KEPT = 12;   // plan -> Map(battery -> ranked steps), least recently used out
+
+// What a toll prices, before any battery: the tenor's months, each as the curve's distinct days and each
+// scenario's history days on the curve. Depends on the curve, the history and the tenor only, so the
+// app keeps it while the battery changes.
+export function tollPlan(cv, docs, years, { start, months, today }) {
   check(cv, start, today);
   const mkt = cv.market, tenor = tenorMonths(cv, start, months);
   const hist = historyMonths(docs, mkt.code, null);
   const ys = Object.keys(docs).map(Number).sort((a, b) => a - b);
   const yRef = ys.length ? sum(ys) / ys.length : ymd(start).y;
-  const idx = monthIndex(cv), cache = new Map();
-  const rows = tenor.map((mo, k) => {
-    const m = mo.month, { y: my, m: mm } = ymd(m);
-    const days = new Map();
-    for (const i of idx.get(m)) { if (!days.has(cv.day[i])) days.set(cv.day[i], []); days.get(cv.day[i]).push(cv.price[i]); }
-    let intrinsic = 0.0;
-    for (const p of days.values()) {
-      const key = p.join(",");
-      if (!cache.has(key)) cache.set(key, batteryDp(p, hours, round_trip, cycles));
-      intrinsic += cache.get(key)[0];
-    }
-    const groups = dayGroups(cv, idx.get(m)), ndays = sum(groups.map((g) => g[2])), scen = new Map(), used = [];
+  const idx = monthIndex(cv);
+  const days = tenor.map((mo) => {                // [curve's days, its number of days, Map year -> [history days, covered]]
+    const m = mo.month, { m: mm } = ymd(m), groups = dayGroups(cv, idx.get(m)), scen = new Map();
     for (const y of ys) {
       const hm = hist.get(`${y}-${mm}`);
       if (!hm) continue;
-      const r = tollMonth(hm, mo, groups, hours, round_trip, cycles);
-      if (r) { scen.set(y, r[0]); used.push(r[1] / ndays); }
+      const [ds, covered] = historyDays(hm, mo, groups);
+      if (covered) scen.set(y, [ds, covered]);
     }
-    return { month: m, k, year: my, intrinsic, scen, spot: scen.size ? sum([...scen.values()]) / scen.size : intrinsic,
-      mwhDay: used.length ? sum(used) / used.length : null };
+    return [curveDays(cv, idx.get(m)), sum(groups.map((g) => g[2])), scen];
   });
-  return { start, months, hours, rows, ys, yRef };
+  return { start, months, tenor, days, ys, yRef };
+}
+
+// The slow part of a toll, which only the curve, the history, the tenor and the battery change: per
+// month, the intrinsic value and each scenario's, in EUR per MW. `cycles` is the contract's average a
+// day over each contract year (at most DAILY_MAX in a day); `mw` the project's power and `impact` the
+// price move per GW of it as a share of the month's base price. With `free` the months also carry the
+// same battery as a price-taker (the bridge's own-impact step); `options` adds each cycle limit. `plan`
+// (from tollPlan, for the same curve, history and tenor) saves building it again.
+export function tollMonths(cv, docs, years, { start, months, hours = 2, round_trip = 0.85, cycles = 1.0, today, mw = 0.0, impact = 0.0,
+  options = CYCLE_OPTIONS, free = true, plan: given = null }) {
+  const P = given || tollPlan(cv, docs, years, { start, months, today });
+  const { tenor, days: plan, ys, yRef } = P;
+  const sized = mw > 0 && impact > 0;
+  const cache = new Map();
+  // Map "contract year|curve or history year" -> { src, items: steps best first, days }; `own`: with the
+  // project's impact. The slow part: kept with the plan, so other cycle limits come free.
+  const ranked = (own) => {
+    const key = `${hours}|${round_trip}|${own && sized ? `${mw}|${impact}` : "taker"}`;
+    if (!poolCache.has(P)) poolCache.set(P, new Map());
+    const memo = poolCache.get(P);
+    if (memo.has(key)) { const hit = memo.get(key); memo.delete(key); memo.set(key, hit); return hit; }
+    const pools = rankPools(own);
+    memo.set(key, pools);
+    if (memo.size > POOLS_KEPT) memo.delete(memo.keys().next().value);
+    return pools;
+  };
+  const rankPools = (own) => {
+    const pools = new Map();
+    plan.forEach(([cdays, ndays, scen], k) => {
+      const mo = tenor[k], d = own && sized ? impact * Math.max(mo.base, 0.0) * mw / 1000.0 : 0.0, c = Math.floor(k / 12);
+      const ck = `${c}|curve`;
+      if (!pools.has(ck)) pools.set(ck, { c, src: "curve", items: [], days: 0 });
+      const pc = pools.get(ck);
+      for (const [p, cnt, pk] of cdays) {
+        const key = `${pk}|${d}`;
+        if (!cache.has(key)) cache.set(key, daySteps(batteryCurve(p, hours, round_trip, d)));
+        for (const [q, v] of cache.get(key)) pc.items.push([v / q, q * cnt, v * cnt, k]);
+      }
+      pc.days += ndays;
+      for (const [y, [ds, covered]] of scen) {
+        const yk = `${c}|${y}`;
+        if (!pools.has(yk)) pools.set(yk, { c, src: y, items: [], days: 0 });
+        const py = pools.get(yk);
+        for (const [p, w] of ds) for (const [q, v] of daySteps(batteryCurve(p, hours, round_trip, d))) py.items.push([v / q, q * w, v * w, k]);
+        py.days += covered;
+      }
+    });
+    for (const pool of pools.values()) pool.items.sort((a, b) => b[0] - a[0]);
+    return pools;
+  };
+  // per month: intrinsic, each scenario and their mean; the shadow price (mean over scenario-years) and cycles a day used
+  const values = (pools, budget) => {
+    const got = plan.map(() => new Map()), shadow = [];
+    let mwh = 0.0, daysUsed = 0;
+    for (const { src, items, days } of pools.values()) {
+      const [g, lam] = spend(items, budget * hours * days);
+      if (src !== "curve") {
+        shadow.push(lam);
+        let sub = 0.0;
+        for (const v of g.values()) sub += v[1];
+        mwh += sub;
+        daysUsed += days;
+      }
+      for (const [k, v] of g) got[k].set(src, v[0]);
+    }
+    const out = plan.map(([, , scen], k) => {
+      const intr = got[k].has("curve") ? got[k].get("curve") : 0.0, sc = new Map();
+      for (const y of scen.keys()) sc.set(y, got[k].has(y) ? got[k].get(y) : 0.0);
+      return { intrinsic: intr, scen: sc, spot: sc.size ? sum([...sc.values()]) / sc.size : intr };
+    });
+    return [out, shadow.length ? sum(shadow) / shadow.length : 0.0, daysUsed ? mwh / daysUsed / hours : null];
+  };
+  const at = ranked(true);
+  const [main, shadow, used] = values(at, cycles);
+  const taker = sized && free ? values(ranked(false), cycles)[0] : main;
+  const opts = options.map((c) => values(at, c));
+  const rows = main.map((r, k) => ({ month: tenor[k].month, k, year: ymd(tenor[k].month).y, ...r,
+    free: { intrinsic: taker[k].intrinsic, spot: taker[k].spot }, options: opts.map((o) => [o[0][k].intrinsic, o[0][k].spot]) }));
+  return { start, months, hours, cycles, mw, impact, rows, ys, yRef, shadow, cyclesPerDay: used,
+    options: options.map((c, j) => ({ cycles: c, cycles_per_day: opts[j][2] })) };
 }
 
 // The toll in EUR per MW per year.
 export function tollValue(tm, { availability = 0.97, degradation = 0.02, realism = 0.7, other = 0, trend = 0, risk = 0.1,
   margin = 0.05, discount = 0, today }) {
-  const { ys, yRef, months, hours } = tm;
+  const { ys, yRef, months } = tm;
   const rows = tm.rows.map((r) => ({ ...r, df: (1 + discount) ** -tau(r.month, today),
     adj: availability * (1 - degradation) ** Math.floor(r.k / 12) * (1 + trend) ** (r.year - yRef) }));
   const wdf = sum(rows.map((r) => r.df));
   const lev = (xs) => 12 * sum(rows.map((r, i) => r.df * xs[i])) / wdf;
-  const real = (r, s) => r.intrinsic + realism * (s - r.intrinsic);
-  const a0 = lev(rows.map((r) => r.intrinsic)), a1 = lev(rows.map((r) => r.spot));
-  const a2 = a0 + realism * (a1 - a0), a3 = availability * a2;
-  const a4 = lev(rows.map((r) => real(r, r.spot) * availability * (1 - degradation) ** Math.floor(r.k / 12)));
-  const a5 = lev(rows.map((r) => real(r, r.spot) * r.adj));
+  const real = (i, s) => i + realism * (s - i);
+  const a0 = lev(rows.map((r) => r.free.intrinsic)), a1 = lev(rows.map((r) => r.free.spot));
+  const a2 = a0 + realism * (a1 - a0);
+  const b0 = lev(rows.map((r) => r.intrinsic)), b1 = lev(rows.map((r) => r.spot));   // the project's own size
+  const b2 = b0 + realism * (b1 - b0), a3 = availability * b2;
+  const a4 = lev(rows.map((r) => real(r.intrinsic, r.spot) * availability * (1 - degradation) ** Math.floor(r.k / 12)));
+  const a5 = lev(rows.map((r) => real(r.intrinsic, r.spot) * r.adj));
   const a6 = a5 + other, a7 = a6 * (1 - risk), a8 = a7 * (1 - margin);
   const steps = [
     { key: "intrinsic", label: "Intrinsic: the curve's daily shape", value: a0, total: true },
     { key: "extrinsic", label: "Extrinsic: history's daily swings", value: a1 - a0 },
     { key: "realism", label: "Extrinsic you won't capture", value: a2 - a1 },
-    { key: "availability", label: "Availability", value: a3 - a2 },
+    { key: "impact", label: "Own price impact", value: b2 - a2 },
+    { key: "availability", label: "Availability", value: a3 - b2 },
     { key: "degradation", label: "Degradation", value: a4 - a3 },
     { key: "trend", label: "Trend in daily spreads", value: a5 - a4 },
     { key: "other", label: "Other revenue (yours)", value: other },
@@ -426,16 +597,28 @@ export function tollValue(tm, { availability = 0.97, degradation = 0.02, realism
     const per = ys.filter((y) => rs.some((r) => r.scen.has(y))).map((y) => sum(rs.map((r) => (r.scen.has(y) ? r.scen.get(y) : r.spot))));
     yearsOut.push({ from: rs[0].month, months: rs.length, intrinsic: sum(rs.map((r) => r.intrinsic)), spot: sum(rs.map((r) => r.spot)),
       spot_min: per.length ? Math.min(...per) : null, spot_max: per.length ? Math.max(...per) : null,
-      net: sum(rs.map((r) => real(r, r.spot) * r.adj)) + other * rs.length / 12 });
+      net: sum(rs.map((r) => real(r.intrinsic, r.spot) * r.adj)) + other * rs.length / 12 });
   }
   const scenarios = ys.filter((y) => rows.some((r) => r.scen.has(y)))
-    .map((y) => ({ year: y, value: lev(rows.map((r) => real(r, r.scen.has(y) ? r.scen.get(y) : r.spot) * r.adj)) + other,
+    .map((y) => ({ year: y, value: lev(rows.map((r) => real(r.intrinsic, r.scen.has(y) ? r.scen.get(y) : r.spot) * r.adj)) + other,
       months: rows.filter((r) => r.scen.has(y)).length }));
-  const used = rows.map((r) => r.mwhDay).filter((x) => x != null);
+  const byCycles = tm.options.map((o, j) => {
+    const v = lev(rows.map((r) => real(r.options[j][0], r.options[j][1]) * r.adj)) + other;
+    return { cycles: o.cycles, value: v, offer: v * (1 - risk) * (1 - margin), cycles_per_day: o.cycles_per_day };
+  });
   const missing = rows.filter((r) => !r.scen.size).length;
   const notes = missing ? [`${missing} of ${rows.length} months have no complete history days in the chosen years: they use the intrinsic value.`] : [];
-  return { start: tm.start, months, steps, offer: a8, spot: a1, intrinsic: a0, cycles_per_day: used.length ? sum(used) / used.length / hours : null,
-    years: yearsOut, scenarios, y_ref: yRef, notes };
+  return { start: tm.start, months, steps, offer: a8, value: a6, spot: a1, intrinsic: a0, cycles: tm.cycles, mw: tm.mw, shadow: tm.shadow,
+    cycles_per_day: tm.cyclesPerDay, years: yearsOut, scenarios, by_cycles: byCycles, y_ref: yRef, notes };
+}
+
+// The toll as the project grows: [{ mw, value (before risk and margin), offer }], EUR per MW a year.
+export function tollSizes(cv, docs, years, o) {
+  const plan = o.plan || tollPlan(cv, docs, years, o);
+  return o.sizes.map((mw) => {
+    const v = tollValue(tollMonths(cv, docs, years, { ...o, mw, options: [], free: false, plan }), o);
+    return { mw, value: v.value, offer: v.offer };
+  });
 }
 
 // ------------------------------------------------------------------ revenue floor
