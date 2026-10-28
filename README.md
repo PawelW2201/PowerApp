@@ -39,10 +39,17 @@ how European power markets work on public data.
   it shows how much better the oracle buys and sells than day-ahead, to calibrate the spikes against a market you
   know. Short spikes are what make waiting pay: a chart shows each way of trading as spikes get longer, bigger or
   more frequent.
+- **Forecast** follows PowerDesk's live forecast of Hungary's day-ahead auction, all 96 quarter-hours. Every morning
+  before the noon auction a LEAR model (a lasso per quarter-hour on the last days' prices, the TSOs' load, wind and
+  solar forecasts for Hungary and Germany, and the calendar, refitted daily on the year before) forecasts the next
+  day; once the auction prints, its prices score the forecast against the naive one (the last comparable day's
+  prices again). It shows the next day's forecast with the inputs that were out when it was made, how the last one
+  did quarter-hour by quarter-hour, the record since it went live, and the backtest for scale.
 
 This repository holds **only the app's code**. It contains no data: when you open Today, the app reads
-`summary.json` from the `dashboard-data` branch of your private PowerDesk repository, and Curve and RfQ read the
-history statistics and hourly history from its `data` branch, straight from GitHub's API, with a read-only token
+`summary.json` from the `dashboard-data` branch of your private PowerDesk repository, Curve and RfQ read the
+history statistics and hourly history from its `data` branch, and Forecast reads the live forecast's summary
+there, straight from GitHub's API, with a read-only token
 you paste once per device. Some of that data is licensed for private use only, which is why it never lives here.
 The quotes you type stay on your device.
 
@@ -67,17 +74,18 @@ To install it: in Chrome or Edge use *Install app*; on Android use *Add to Home 
 | File | What it is |
 |---|---|
 | `index.html` | Page shell and styles |
-| `app.js` | The app: connecting, Today, zone sheets, Products, Curve, RfQ, Options, settings |
+| `app.js` | The app: connecting, Today, zone sheets, Products, Curve, RfQ, Options, Intraday, Forecast, settings |
 | `calendar.js` | Delivery hours of standard products; a port of PowerDesk's `powerdesk/products.py` |
 | `options.js` | Option pricing; a port of PowerDesk's `powerdesk/options.py` |
 | `curve.js` | The forward curve; a port of PowerDesk's `powerdesk/curve.py` |
 | `rfq.js` | PPA and toll pricing against the curve; a port of PowerDesk's `powerdesk/rfq.py` |
 | `intraday.js` | The intraday simulator; a port of PowerDesk's `powerdesk/intraday.py` |
+| `forecast.js` | The Forecast tab's arithmetic on the summaries of PowerDesk's live forecast (`powerdesk/epf.py`): stages, errors, the record |
 | `charts.js` | Small charts: step lines for prices and load, a scatter for price against residual load, lines for option values and curves, and the bridge (waterfall) behind an offer |
 | `sw.js` | Offline copy of the app's own files (never touches GitHub data requests) |
 | `manifest.webmanifest`, `icons/` | Install metadata and icons |
 | `fonts/` | Barlow and Barlow Semi Condensed, SIL Open Font License 1.1 (`fonts/OFL-Barlow.txt`) |
 | `vendor/qrcode.mjs` | QR Code Generator for JavaScript by Kazuhiko Arase, MIT license (header in the file) |
-| `tests/` | Checks `calendar.js`, `options.js`, `curve.js` and `rfq.js` against fixtures made from the Python reference, on synthetic data only: `npm test` |
+| `tests/` | Checks `calendar.js`, `options.js`, `curve.js`, `rfq.js`, `intraday.js` and `forecast.js` against fixtures made from the Python reference, on synthetic data only: `npm test` |
 
 No build step: GitHub Pages serves these files as they are.

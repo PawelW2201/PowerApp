@@ -5,14 +5,15 @@ import * as opt from "./options.js";
 import * as crv from "./curve.js";
 import * as rfq from "./rfq.js";
 import * as idm from "./intraday.js";
-import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, dayNum, weekday, baseHours, isHoliday, zonedToUtc, parse, MONTH_ABBR } from "./calendar.js";
+import * as fcm from "./forecast.js";
+import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, dayNum, weekday, baseHours, isHoliday, zonedToUtc, localParts, parse, MONTH_ABBR } from "./calendar.js";
 
-const VERSION = "0.10.0";
+const VERSION = "0.11.0";
 const STORE = "powerapp.v1";
 const DATA_CACHE = "pa-data-v1";
 const DEFAULT_BRANCH = "dashboard-data";
 const RAW = "application/vnd.github.raw+json";
-const TABS = ["today", "products", "curve", "rfq", "options", "intraday"];
+const TABS = ["today", "products", "curve", "rfq", "options", "intraday", "forecast"];
 const TZ = "Europe/Berlin";
 const DESK_TZ = "Europe/Zurich";   // whose "today" the brief is about
 const C = { price: "var(--s-1)", residual: "var(--s-2)", renew: "var(--s-3)", load: "var(--s-load)", hist: "var(--s-hist)", sel: "var(--ink)" };
@@ -189,7 +190,7 @@ function render() {
   const main = h("main", { id: "view", tabindex: "-1" });
   app.replaceChildren(rail(), h("div", { class: "main-col" }, topbar(), h("div", { id: "status" }), main), tabbar());
   renderStatus();
-  const view = { today: viewToday, products: viewProducts, curve: viewCurve, rfq: viewRfq, options: viewOptions, intraday: viewIntraday }[state.tab];
+  const view = { today: viewToday, products: viewProducts, curve: viewCurve, rfq: viewRfq, options: viewOptions, intraday: viewIntraday, forecast: viewForecast }[state.tab];
   try { main.appendChild(view()); }
   catch (e) { console.error(e); main.appendChild(h("p", { class: "empty", text: `This view couldn't be drawn: ${e.message}` })); }
   const sy = state.ui[`scroll:${state.tab}`];
@@ -200,7 +201,7 @@ function render() {
 function brand() {
   return h("span", { class: "brand" }, h("img", { src: "icons/icon.svg", alt: "", width: 26, height: 26 }), h("span", { class: "brand-name", text: "PowerApp" }));
 }
-const TAB_LABEL = { today: "Today", products: "Products", curve: "Curve", rfq: "RfQ", options: "Options", intraday: "Intraday" };
+const TAB_LABEL = { today: "Today", products: "Products", curve: "Curve", rfq: "RfQ", options: "Options", intraday: "Intraday", forecast: "Forecast" };
 const TAB_ICON = {
   today: "M3 17h3v-4h3v-6h3v9h3v-5h3v3h3",
   products: "M4 5h16v14H4zM4 10h16M9 10v9M14 10v9",
@@ -208,6 +209,7 @@ const TAB_ICON = {
   rfq: "M3.5 3.5h8l9 9-8 8-9-9zM8 8h.01",
   options: "M3 15h8l9-9M3 20h18",
   intraday: "M13 3 5 14h6l-1 7 8-11h-6z",
+  forecast: "M3 16l4-4 3 2 3-3M13 11l8-5M13 11l8 3",
 };
 function navIcon(d) {
   const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -238,7 +240,7 @@ function topbar() {
       s ? h("span", { class: "asof" }, `Brief for ${dayName(s.today, true)}`) : null,
       s ? h("span", { class: "updated", title: s.generated_utc }, `updated ${ago(s.generated_utc)}`) : null),
     h("div", { class: "topbar-actions" },
-      connected() ? h("button", { class: "icon-btn", type: "button", "aria-label": "Refresh", title: "Refresh", id: "refresh-btn", onclick: () => load({ force: true }) },
+      connected() ? h("button", { class: "icon-btn", type: "button", "aria-label": "Refresh", title: "Refresh", id: "refresh-btn", onclick: () => { load({ force: true }); if (state.tab === "forecast") loadForecast({ force: true }); } },
         navIcon("M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7")) : null,
       h("button", { class: "icon-btn", type: "button", "aria-label": "Settings", title: "Settings", onclick: openSettings },
         navIcon("M12 8.5a3.5 3.5 0 1 0 0 7a3.5 3.5 0 1 0 0-7M19.4 13.5l1.6 1.2-2 3.4-1.9-.6a7 7 0 0 1-1.7 1l-.4 2h-4l-.4-2a7 7 0 0 1-1.7-1l-1.9.6-2-3.4 1.6-1.2a7 7 0 0 1 0-3l-1.6-1.2 2-3.4 1.9.6a7 7 0 0 1 1.7-1l.4-2h4l.4 2a7 7 0 0 1 1.7 1l1.9-.6 2 3.4-1.6 1.2a7 7 0 0 1 0 3z"))));
@@ -2055,6 +2057,227 @@ function actionStrip(actions, names) {
   return h("div", { class: "act-strip", role: "img", "aria-label": label }, hours, ...rows);
 }
 
+// ------------------------------------------------------------------ Forecast
+// PowerDesk's live forecast of Hungary's day-ahead auction (epf/live/HU/summary.json on the data
+// branch, written by its epf-live workflow): the next delivery day before the noon auction, how
+// the last one did against the auction's prices, the record since it went live, the backtest.
+const FC = { data: null, source: null, tried: 0, loading: false, error: null };
+const resetForecast = () => Object.assign(FC, { data: null, source: null, tried: 0, error: null });
+const FC_COLOR = { actual: "var(--ink)", main: "var(--s-1)", naive: "var(--s-hist)" };
+const fcName = (m) => fcm.MODEL_NAME[m] || m;
+const andList = (xs) => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
+
+async function loadForecast({ force } = {}) {
+  if (!connected() || FC.loading || (!force && Date.now() - FC.tried < 5 * 60000)) return;
+  FC.loading = true;
+  FC.tried = Date.now();
+  const show = () => { if (state.tab === "forecast") render(); };
+  try {
+    if (!FC.data) {
+      const cached = await cacheGet("epf-HU.json");
+      if (cached) { try { FC.data = JSON.parse(cached.text); FC.source = "cache"; show(); } catch { /* stale */ } }
+    }
+    const text = await gh(contentsPath("epf/live/HU/summary.json", { ...cfg, branch: DATA_BRANCH }), RAW);
+    const d = JSON.parse(text);
+    const changed = FC.source !== "network" || FC.data.updated_utc !== d.updated_utc;
+    Object.assign(FC, { data: d, source: "network", error: null });
+    cachePut("epf-HU.json", text);
+    if (changed || force) show();
+  } catch (e) { FC.error = e; show(); }
+  finally { FC.loading = false; }
+}
+
+// A time from the summary on Budapest's clock, the auction's, named by its day: "10:17 today".
+function budWhen(iso, now) {
+  const p = localParts(Date.parse(iso), fcm.TZ), n = dayNum(p.y, p.m, p.d), t = todayIn(fcm.TZ, now);
+  const clock = `${String(p.h).padStart(2, "0")}:${String(p.mi).padStart(2, "0")}`;
+  return `${clock} ${n === t ? "today" : n === t - 1 ? "yesterday" : n === t + 1 ? "tomorrow" : `on ${dayName(isoDate(n), true)}`}`;
+}
+const inTime = (ms) => { const m = Math.max(1, Math.round(ms / 60000)); return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ""}`; };
+// The delivery day's inputs in words: "Hungary's wind and solar forecasts".
+function inputWords(inputs) {
+  const { out, missing } = fcm.inputsByZone(inputs);
+  const words = (o) => [["HU", "Hungary's"], ["DE", "Germany's"]].filter(([z]) => o[z].length)
+    .map(([z, who]) => `${who} ${andList(o[z])} forecast${o[z].length > 1 ? "s" : ""}`);
+  const nMissing = missing.HU.length + missing.DE.length;
+  return { missing: andList(words(missing)), nMissing, none: nMissing === fcm.INPUTS.length, verb: nMissing > 1 ? "weren't" : "wasn't" };
+}
+const fcLegend = (items) => legend(items.map(([name, color]) => ({ name, color })));
+const sgn2 = (v) => signed(Math.abs(v) < 0.005 ? 0 : v, p2);
+// A delivery day by name, with "Tomorrow" and the like on Budapest's calendar.
+function fcTitle(day, now) {
+  const rel = { [-1]: "Yesterday", 0: "Today", 1: "Tomorrow" }[parseIso(day) - todayIn(fcm.TZ, now)];
+  return rel ? `${rel}, ${dayName(day, true)}` : dayName(day, true);
+}
+
+function viewForecast() {
+  if (!connected()) return connectCard();
+  loadForecast();
+  const d = FC.data, e = FC.error;
+  const head = section("fc-head", kicker("Hungary's day-ahead auction · quarter-hours · €/MWh"), h("h1", { class: "headline", text: "Forecast" }),
+    h("p", { class: "lede", text: "Every morning before the noon auction, a model forecasts the next day's 96 quarter-hour prices from what's public by then: the last days' prices and the TSOs' forecasts of load, wind and solar for Hungary and Germany. When the auction prints, its prices score the forecast, and the naive one beside it (the last comparable day's prices again)." }));
+  if (!d) {
+    const msg = !e ? "Loading the forecast…"
+      : e.status === 404 ? `No live forecast in ${cfg.repo} yet. PowerDesk's epf-live workflow writes it to the ${DATA_BRANCH} branch.`
+      : e.status === 0 ? "Can't reach GitHub. Check your connection, then refresh."
+      : e.status === 401 ? "GitHub rejected the token; it may have expired or been revoked. Add a new one in Settings."
+      : `Loading failed: ${e.message}`;
+    return h("div", { class: "forecast" }, head, h("p", { class: e ? "empty" : "loading-shell", text: msg }));
+  }
+  const now = Date.now(), L = d.latest, S = d.last_scored, st = fcm.stage(L, now);
+  const next = L && st !== "scored" && L.forecasts[L.main] ? fcNext(L, st, now, d) : null;
+  const done = S ? fcScored(S, d, now) : null;
+  // the morning's forecast first; after the auction, how it did (the next day's is only a placeholder then)
+  const nextFirst = next && (L.main !== "naive" || st === "closed" || !done);
+  const why = !e ? "" : e.status === 0 ? "GitHub can't be reached just now" : e.status === 404 ? "the live forecast isn't on the data branch"
+    : e.status === 401 ? "GitHub rejected the token" : `loading failed (${e.message})`;
+  const saved = e ? h("p", { class: "banner fc-banner" }, `Showing the forecast as of ${budWhen(d.updated_utc, now)}: ${why}.`) : null;
+  const run = fcm.nextRun(now);
+  const none = !L ? section("fc-next", h("p", { class: "empty", text: `No forecast yet. The next run is at ${run ? budWhen(new Date(run.at).toISOString(), now) : "10:17"} Budapest time.` })) : null;
+  return h("div", { class: "forecast" }, head, saved, none, nextFirst ? [next, done] : [done, next], fcRecord(d), fcBacktest(d), fcHow());
+}
+
+// The next delivery day: the forecast so far, which inputs it had, when the auction closes.
+function fcNext(L, st, now, d) {
+  const day = L.target, main = L.main, holder = main === "naive";
+  const f = L.forecasts[main], nv = L.forecasts.naive, ds = fcm.dayStats(f, day), from = fcm.naiveFrom(day);
+  const gate = Date.parse(L.gate_utc), run = fcm.nextRun(now), w = inputWords(L.inputs), bt = d.backtest && d.backtest.models;
+  const missingNow = w.none ? `none of the TSOs' forecasts for ${dayName(day, true)} were out` : `${w.missing} ${w.verb} out`;
+  let status;
+  if (st === "closed") status = `The auction closed at ${budWhen(L.gate_utc, now)}. Its prices are usually out by about 12:45, and the 13:47 run scores this forecast, made at ${budWhen(L.made_utc, now)}${holder ? ": the naive, since the model's inputs weren't out" : ` by ${fcName(main)}`}.`;
+  else if (holder) {
+    const gateDay = parseIso(day) - 1, today = todayIn(fcm.TZ, now);
+    const then = today < gateDay
+      ? `The TSOs' load forecasts are due by 10:00 on the day of the auction (wind and solar only by 18:00, though they often come sooner), so the model forecasts at 10:17 and 11:41 ${gateDay === today + 1 ? "tomorrow" : `on ${dayName(isoDate(gateDay), true)}`}, before the auction closes at noon.`
+      : run && run.at < gate ? `The next run, at ${budWhen(new Date(run.at).toISOString(), now)}, forecasts with the model if they're out by then; the auction closes at noon.`
+      : "No run is left before the auction closes at noon, so the naive is the forecast that will be scored.";
+    status = `For now this is the naive forecast, the prices of ${dayName(from.day, true)} again: when it was made, at ${budWhen(L.made_utc, now)}, ${missingNow}. ${then}`;
+  }
+  else status = `Made at ${budWhen(L.made_utc, now)} by ${fcName(main)}. The auction closes at ${budWhen(L.gate_utc, now)}, in ${inTime(gate - now)}: the last forecast made before then is the one scored.`;
+  const inputsNote = holder ? null
+    : main === "lear" ? "Every input was out: Hungary's and Germany's load, wind and solar forecasts for the day."
+    : `${w.missing[0].toUpperCase()}${w.missing.slice(1)} ${w.verb} out yet, so this is LEAR without wind and solar` +
+      (bt && bt.lear && bt.lear_nores ? ` (in the backtest it missed by ${p2(bt.lear_nores.mae)} €/MWh a quarter-hour, LEAR by ${p2(bt.lear.mae)}).` : ".");
+  const box = h("div", { class: "chart-box" });
+  const series = [...(holder ? [] : [{ name: "Forecast", values: f, color: FC_COLOR.main }]), ...(nv ? [{ name: "Naive", values: nv, color: FC_COLOR.naive }] : [])];
+  stepChart(box, { t: fcm.clockAxis(day), step: 900, tz: "UTC", series, fmt: p2, tickFmt: tick, height: 170,
+    label: `Forecast of Hungary's day-ahead prices for ${dayName(day, true)}, €/MWh, by quarter-hour` });
+  box.appendChild(fcLegend([...(holder ? [] : [[`Forecast (${fcName(main)})`, FC_COLOR.main]]), ...(nv ? [[`Naive (${dayName(from.day, true)}'s prices)`, FC_COLOR.naive]] : [])]));
+  const cols = holder ? ["Time", "Naive"] : ["Time", "Forecast", "Naive"];
+  return section("fc-next",
+    kicker(st === "closed" ? "The auction has closed" : holder ? "Waiting for the model's inputs" : "Forecast before the auction"),
+    h("h2", { class: "h2", text: fcTitle(day, now) }),
+    h("p", { class: "lede", text: status }),
+    h("div", { class: "stats" },
+      stat("Base", p2(ds.base), !holder && nv ? `naive ${p2(fcm.dayStats(nv, day).base)}` : null),
+      stat("Peak", ds.peak == null ? "—" : p2(ds.peak), ds.peak == null ? "No peak hours at the weekend" : "Mon–Fri 08–20"),
+      stat("Low", p2(ds.min), `at ${ds.minAt}`),
+      stat("High", p2(ds.max), `at ${ds.maxAt}`)),
+    box,
+    inputsNote ? h("p", { class: "note", text: inputsNote }) : null,
+    h("details", { class: "raw" }, h("summary", { text: "Show the quarter-hours as a table" }),
+      table(cols, f.map((v, i) => h("tr", null, h("th", { scope: "row", text: fcm.slot(i) }), holder ? null : num(p2(v)), num(nv ? p2(nv[i]) : "—"))),
+        { caption: `Forecast for ${dayName(day, true)} by quarter-hour, €/MWh` })));
+}
+
+// The last scored day: the forecast that counted against the auction's prices, beside the naive.
+function fcScored(S, d, now) {
+  const day = S.target, main = S.main, sc = S.scores, a = S.actual, model = main !== "naive";
+  const f = S.forecasts[main], nv = S.forecasts.naive, ms = sc[main], ns = sc.naive;
+  const act = fcm.dayStats(a, day), fst = fcm.dayStats(f, day), from = fcm.naiveFrom(day);
+  const gain = model && ns ? 1 - ms.mae / ns.mae : null;
+  const w = inputWords(S.inputs);
+  const status = model
+    ? `${fcName(main)} made it at ${budWhen(S.made_utc, now)}, before the auction closed at noon. The naive is the prices of ${dayName(from.day, true)} again.`
+    : `The model didn't forecast this day: when the last run before the auction went, at ${budWhen(S.made_utc, now)}, ${w.none ? "none of the TSOs' forecasts were out" : `${w.missing} ${w.verb} out`}. So the naive, the prices of ${dayName(from.day, true)} again, was the forecast.`;
+  const box = h("div", { class: "chart-box" }), group = crosshairGroup(), t = fcm.clockAxis(day);
+  const err = (x) => fcm.errors(x, a).e;
+  box.appendChild(h("h3", { class: "h3", text: "Prices, €/MWh" }));
+  stepChart(box, { t, step: 900, tz: "UTC", group, fmt: p2, tickFmt: tick, height: 170,
+    series: [{ name: "Auction", values: a, color: FC_COLOR.actual }, ...(model ? [{ name: "Forecast", values: f, color: FC_COLOR.main }] : []),
+      ...(nv ? [{ name: "Naive", values: nv, color: FC_COLOR.naive }] : [])],
+    label: `Hungary's day-ahead prices on ${dayName(day, true)}: the auction, the forecast and the naive, €/MWh` });
+  box.appendChild(h("h3", { class: "h3", text: "Forecast minus auction, €/MWh" }));
+  stepChart(box, { t, step: 900, tz: "UTC", group, fmt: sgn2, tickFmt: tick, height: 110, zero: true,
+    series: [...(model ? [{ name: "Forecast", values: err(f), color: FC_COLOR.main }] : []), ...(nv ? [{ name: "Naive", values: err(nv), color: FC_COLOR.naive }] : [])],
+    label: "How far the forecast and the naive were from the auction, quarter-hour by quarter-hour, €/MWh" });
+  box.appendChild(fcLegend([["Auction", FC_COLOR.actual], ...(model ? [[`Forecast (${fcName(main)})`, FC_COLOR.main]] : []), ...(nv ? [[`Naive (${dayName(from.day, true)}'s prices)`, FC_COLOR.naive]] : [])]));
+  const rows = fcm.MODELS.filter((m) => sc[m]).map((m) => h("tr", { class: m === main ? "current" : null },
+    h("th", { scope: "row", text: m === main ? `${fcName(m)}, the forecast` : fcName(m) }), num(p2(sc[m].mae)), num(p2(sc[m].rmse)), num(sgn2(sc[m].bias))));
+  const cols = ["Time", "Auction", ...(model ? ["Forecast"] : []), "Naive"];
+  return section("fc-done", kicker("Forecast against the auction"), h("h2", { class: "h2", text: fcTitle(day, now) }),
+    h("p", { class: "lede", text: status }),
+    h("div", { class: "stats" },
+      stat("Forecast missed by", p2(ms.mae), "€/MWh a quarter-hour, on average"),
+      model && ns ? stat("Naive missed by", p2(ns.mae), `the forecast did ${pct(Math.abs(gain), 0)} ${gain >= 0 ? "better" : "worse"}`) : null,
+      stat("Bias", sgn2(ms.bias), ms.bias >= 0 ? "the forecast was high on average" : "the forecast was low on average"),
+      stat("Auction base", p2(act.base), `forecast ${p2(fst.base)}`),
+      stat("Auction high", p2(act.max), `at ${act.maxAt}; forecast ${p2(fst.max)} at ${fst.maxAt}`),
+      stat("Auction low", p2(act.min), `at ${act.minAt}; forecast ${p2(fst.min)} at ${fst.minAt}`)),
+    box,
+    h("h3", { class: "h3 sp", text: "Every model on the day" }),
+    table(["", "MAE", "RMSE", "Bias"], rows, { cls: "wrap", caption: "Each model's errors on the day, €/MWh" }),
+    h("p", { class: "note", text: "€/MWh over the day's 96 quarter-hours. MAE is the mean absolute error, RMSE weighs big misses more, bias is the average of forecast minus auction. The other models ran on the same inputs as the forecast; only one counts." }),
+    h("details", { class: "raw" }, h("summary", { text: "Show the quarter-hours as a table" }),
+      table(cols, a.map((v, i) => h("tr", null, h("th", { scope: "row", text: fcm.slot(i) }), num(p2(v)), model ? num(p2(f[i])) : null, num(nv ? p2(nv[i]) : "—"))),
+        { caption: `The auction, the forecast and the naive on ${dayName(day, true)} by quarter-hour, €/MWh` })));
+}
+
+// Every scored day since it went live: the forecast that counted against the naive.
+function fcRecord(d) {
+  const r = fcm.record(d.days);
+  const sec = section("fc-record", kicker("Since it went live"), h("h2", { class: "h2", text: "The record" }));
+  if (!r) { sec.appendChild(h("p", { class: "empty", text: "No day scored yet. Each is scored after its auction, at 13:47 Budapest time." })); return sec; }
+  sec.appendChild(h("div", { class: "stats" },
+    stat("Days scored", int(r.days), r.model < r.days ? `${r.model} by the model, ${r.days - r.model} by the naive` : "all forecast by the model"),
+    stat("Forecast MAE", p2(r.main), "€/MWh, the forecast that counted"),
+    stat("Naive MAE", p2(r.naive), "the same days"),
+    stat("Relative MAE", r.ratio == null ? "—" : nf2.format(r.ratio), "forecast over naive: below 1 beats it"),
+    r.model ? stat("Beat the naive", `${r.wins} of ${r.model}`, "days the model forecast") : null));
+  const days = d.days.filter((x) => x.mae[x.main] != null);
+  if (days.length >= 3) {
+    const box = h("div", { class: "chart-box" }), old = [...days].reverse();
+    lineChart(box, { x: old.map((x) => parseIso(x.target)), xFmt: (n) => dayName(isoDate(n)), xInt: true, fmt: p2, tickFmt: tick, height: 150, zero: true,
+      series: [{ name: "Forecast", values: old.map((x) => x.mae[x.main]), color: FC_COLOR.main }, { name: "Naive", values: old.map((x) => x.mae.naive ?? null), color: FC_COLOR.naive }],
+      label: "Each scored day's mean absolute error, the forecast and the naive, €/MWh" });
+    box.appendChild(fcLegend([["Forecast", FC_COLOR.main], ["Naive", FC_COLOR.naive]]));
+    sec.append(h("h3", { class: "h3", text: "Each day's mean absolute error, €/MWh" }), box);
+  }
+  const row = (x) => h("tr", null, h("th", { scope: "row", class: "nowrap", text: dayName(x.target, true) }), num(p2(x.price), "wide"),
+    h("td", { text: x.main === "naive" ? "Naive" : fcName(x.main) }), num(p2(x.mae[x.main])), num(x.mae.naive == null ? "—" : p2(x.mae.naive)));
+  const head = () => ["", h("th", { class: "wide", text: "Auction base" }), h("th", { style: { textAlign: "left" }, text: "Forecast by" }), "Forecast MAE", "Naive MAE"];
+  sec.appendChild(table(head(), days.slice(0, 14).map(row), { cls: "wrap", caption: "Each scored day, newest first, €/MWh" }));
+  if (days.length > 14) sec.appendChild(h("details", { class: "raw" }, h("summary", { text: `Show the ${days.length - 14} days before` }),
+    table(head(), days.slice(14).map(row), { cls: "wrap", caption: "Earlier scored days, €/MWh" })));
+  const tot = d.totals || {}, models = fcm.MODELS.filter((m) => tot[m]);
+  if (models.length > 1) sec.appendChild(h("details", { class: "raw" }, h("summary", { text: "Each model on the days it ran" }),
+    table(["", "Days", "MAE"], models.map((m) => h("tr", null, h("th", { scope: "row", text: fcName(m) }), num(int(tot[m].days)), num(p2(tot[m].mae)))), { caption: "Each model's mean absolute error on the days it forecast, €/MWh" }),
+    h("p", { class: "note", text: "Each model counts only the days its inputs were out, so the days differ and these don't compare with each other the way the backtest's do." })));
+  sec.appendChild(h("p", { class: "note", text: "A few weeks say little on their own: a day's error swings with the day (one spike can double it), so only the long run, like the backtest's, compares models." }));
+  return sec;
+}
+
+// The backtest the live forecast repeats every day, for scale.
+function fcBacktest(d) {
+  const b = d.backtest;
+  if (!b || !b.models || !b.models.naive) return null;
+  const range = `${dayName(b.start, true)} ${ymd(parseIso(b.start)).y} to ${dayName(b.end, true)} ${ymd(parseIso(b.end)).y}`;
+  const rows = fcm.MODELS.filter((m) => b.models[m]).map((m) => h("tr", null, h("th", { scope: "row", text: fcName(m) }), num(p2(b.models[m].mae)), num(nf2.format(b.models[m].rmae))));
+  const lear = b.models.lear;
+  return section("fc-bt", kicker("For scale"), h("h2", { class: "h2", text: "The backtest" }),
+    h("p", { class: "lede", text: `Every model forecast every day from ${range} (${int(b.days)} days) as it runs live, refitted each day on the year before.` +
+      (lear ? ` LEAR missed by ${p2(lear.mae)} €/MWh a quarter-hour on average, the naive by ${p2(b.models.naive.mae)}.` : "") }),
+    table(["", "MAE, €/MWh", "Relative MAE"], rows, { cls: "wrap", caption: "Each model's errors in the backtest" }),
+    h("p", { class: "note", text: "Relative MAE is a model's MAE over the naive's on the same days: below 1 beats it. In the backtest LEAR had the TSOs' wind and solar forecasts every day, though they're only due by 18:00 the day before, after the auction; LEAR without them is what could always have been run." }));
+}
+
+function fcHow() {
+  return section("fc-how", h("h2", { class: "h2", text: "How it works" }),
+    h("p", { class: "note", text: "LEAR, after the benchmark of Lago, Marcjasz, De Schutter and Weron (2021): one linear model for each quarter-hour, refitted every day on the year before, with the lasso keeping only the inputs that help (its penalty chosen by AIC). Prices go through an asinh transform around the year's median, so a spike doesn't dominate the fit. The inputs: the same quarter-hour's price a day, two days and a week before; the day before's average, high, low and last quarter-hour; the TSOs' forecasts for the day of Hungary's and Germany's load, wind and solar, and their residual load; the weekday and Hungarian holidays." }),
+    h("p", { class: "note", text: "The forecast that counts is LEAR when every input is out, LEAR without wind and solar when only the load forecasts are, and the naive otherwise: the same quarter-hour a week before for a Monday, Saturday or Sunday, the day before for the rest." }),
+    h("p", { class: "note", text: "PowerDesk's epf-live workflow runs at 10:17 and 11:41 Budapest time, before the auction closes at noon, and at 13:47 and 18:17 to score the day the auction priced and start the next. GitHub sometimes runs scheduled workflows late. Prices and forecasts come from ENTSO-E; the auction is SDAC's for the Hungarian zone, in quarter-hours since October 2025." }));
+}
+
 // ------------------------------------------------------------------ sheets
 function renderSheet(sheet) {
   const root = $("#sheet-root");
@@ -2109,7 +2332,7 @@ function connectForm({ compact } = {}) {
   const tokenIn = h("input", { type: "password", class: "input", placeholder: "github_pat_…", autocomplete: "off", spellcheck: "false", id: "tok" });
   const msg = h("p", { class: "form-msg", role: "status" });
   const pick = h("div", { class: "pick row-btns" });
-  const finish = (repo, token) => { saveCfg({ token, repo, branch: DEFAULT_BRANCH }); state.summary = null; go("#/today"); render(); load({ force: true }); };
+  const finish = (repo, token) => { saveCfg({ token, repo, branch: DEFAULT_BRANCH }); state.summary = null; resetForecast(); go("#/today"); render(); load({ force: true }); };
   const connect = async () => {
     const token = tokenIn.value.trim();
     if (!token) { msg.textContent = "Paste the token first."; tokenIn.focus(); return; }
@@ -2176,7 +2399,7 @@ function viewSettings() {
       try {
         const text = await gh(contentsPath("summary.json", next), RAW, next.token);
         if (!isPowerSummary(JSON.parse(text))) { msg.textContent = "That branch has a summary.json, but it isn't a PowerDesk brief."; return; }
-        saveCfg(next); state.summary = null; await cacheClear(); msg.textContent = "Connected. Brief found."; load({ force: true });
+        saveCfg(next); state.summary = null; resetForecast(); await cacheClear(); msg.textContent = "Connected. Brief found."; load({ force: true });
       } catch (e) { msg.textContent = e.status === 401 ? "GitHub rejected that token." : e.status === 404 ? "No brief there. Check the repository and branch, and that the token can read it." : `Check failed: ${e.message}`; }
     };
     const qrBox = h("div", { class: "qr-box" });
@@ -2233,10 +2456,10 @@ function viewSettings() {
     h("section", { class: "set-sec" }, h("h3", { class: "h3", text: "This device" }),
       state.summary ? h("p", { class: "muted" }, `Brief for ${dayName(state.summary.today, true)}, built ${ago(state.summary.generated_utc)}.`) : null,
       h("div", { class: "row-btns" },
-        connected() ? h("button", { type: "button", class: "btn ghost", onclick: async () => { await cacheClear(); state.summary = null; load({ force: true }); } }, "Reload the brief") : null,
+        connected() ? h("button", { type: "button", class: "btn ghost", onclick: async () => { await cacheClear(); state.summary = null; resetForecast(); load({ force: true }); } }, "Reload the brief") : null,
         connected() ? h("button", { type: "button", class: "btn danger", onclick: async () => {
           if (!confirm("Disconnect this device? The token and the saved brief are removed from it.")) return;
-          await cacheClear(); store.set({ theme: cfg.theme, products: cfg.products }); cfg = store.get(); state.summary = null; sheetPushed = false; go("#/today"); render();
+          await cacheClear(); store.set({ theme: cfg.theme, products: cfg.products }); cfg = store.get(); state.summary = null; resetForecast(); sheetPushed = false; go("#/today"); render();
         } }, "Disconnect this device") : null),
       h("p", { class: "muted small" }, `PowerApp ${VERSION}`)));
 }
@@ -2325,6 +2548,7 @@ window.addEventListener("hashchange", () => {
 });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && connected() && state.fetchedAt && Date.now() - Date.parse(state.fetchedAt) > 10 * 60000) load();
+  if (document.visibilityState === "visible" && state.tab === "forecast") loadForecast();
 });
 
 importSetupLink();
