@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { tenorCurve, ppa, toll, batteryDp, historyMonths } from "../rfq.js";
+import { tenorCurve, ppa, toll, tollMonths, floorValue, batteryDp, historyMonths } from "../rfq.js";
 import { parseIso, isoDate } from "../calendar.js";
 
 const fx = JSON.parse(readFileSync(new URL("./rfq-fixture.json", import.meta.url)));
@@ -42,6 +42,19 @@ for (const cs of fx.cases) {
         assert.equal(isoDate(y.from), e.years[i].from);
         for (const k of ["months", "intrinsic", "spot", "spot_min", "spot_max", "net"]) close(y[k], e.years[i][k], `year ${e.years[i].from} ${k}`);
       });
+      // the same battery under a revenue floor
+      const tech = { hours: o.hours, round_trip: o.round_trip, cycles: o.cycles };
+      Object.keys(tech).forEach((k) => tech[k] === undefined && delete tech[k]);
+      const tm = tollMonths(cv, docs, fx.years, { start, months: cs.months, today, ...tech });
+      for (const fl of cs.floors) {
+        const f = floorValue(tm, { ...fl.args, today }), g = fl.result;
+        for (const k of ["expected", "level", "cap_level", "fair_fee", "fee", "share_fair", "share", "chance", "pv_put", "pv_call"]) close(f[k], g[k], `floor ${k}`);
+        assert.equal(f.years.length, g.years.length);
+        f.years.forEach((y, i) => {
+          assert.equal(isoDate(y.from), g.years[i].from);
+          for (const k of ["months", "expected", "floor", "sd", "chance", "payout", "df", "pv_put", "pv_call"]) close(y[k], g.years[i][k], `floor year ${g.years[i].from} ${k}`);
+        });
+      }
     }
   });
 }

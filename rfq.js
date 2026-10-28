@@ -13,7 +13,12 @@
 // Toll (EUR/MW/year): intrinsic (the curve's daily shape) -> extrinsic (history's daily swings) ->
 // the share of it trading won't capture -> availability -> degradation -> spread trend -> other
 // revenue -> risk -> margin = offer. Both levelized with a discount rate, monthly, mid-month.
+// Revenue floor: the provider pays max(F - R, 0) after a year whose revenue R ends below F, a put
+// on R. R is lognormal around the toll's expected revenue with log variance vol_year^2 (a year's
+// own surprise) + vol_drift^2 (t_start + T/3) (the level's drift, earned through the year like an
+// average), so each year is a Black-76 put; an upside share above a threshold is a call.
 import { build, genProfile, daytype } from "./curve.js";
+import { black76, N } from "./options.js";
 import { getMarket, zonedToUtc, ymd, dayNum, localParts } from "./calendar.js";
 
 export const MIN_MEAN = 5.0;
@@ -431,4 +436,42 @@ export function tollValue(tm, { availability = 0.97, degradation = 0.02, realism
   const notes = missing ? [`${missing} of ${rows.length} months have no complete history days in the chosen years: they use the intrinsic value.`] : [];
   return { start: tm.start, months, steps, offer: a8, spot: a1, intrinsic: a0, cycles_per_day: used.length ? sum(used) / used.length / hours : null,
     years: yearsOut, scenarios, y_ref: yRef, notes };
+}
+
+// ------------------------------------------------------------------ revenue floor
+// A floor on the battery of tollMonths: `floor` and `cap` (the threshold for an upside share) are
+// fractions of the levelized expected revenue, one level for every year; the fee is paid at each
+// year's end; `margin` loads the fair fee and the share.
+export function floorValue(tm, { floor = 0.7, vol_year = 0.25, vol_drift = 0.1, cap = 1.0, margin = 0.15, availability = 0.97,
+  degradation = 0.02, realism = 0.7, other = 0, trend = 0, discount = 0, today }) {
+  const { yRef, months } = tm;
+  const rows = tm.rows.map((r) => ({ ...r, df: (1 + discount) ** -tau(r.month, today),
+    adj: availability * (1 - degradation) ** Math.floor(r.k / 12) * (1 + trend) ** (r.year - yRef) }));
+  const real = rows.map((r) => (r.intrinsic + realism * (r.spot - r.intrinsic)) * r.adj);
+  const wdf = sum(rows.map((r) => r.df));
+  const expected = 12 * sum(rows.map((r, i) => r.df * real[i])) / wdf + other;
+  const level = floor * expected, capLevel = cap * expected;
+  const years = [];
+  for (let k = 0; k < Math.ceil(months / 12); k++) {
+    const idx = [];
+    rows.forEach((r, i) => { if (Math.floor(r.k / 12) === k) idx.push(i); });
+    const n = idx.length, first = rows[idx[0]].month;
+    const t0 = (first - today) / 365.25, t1 = (addMonths(first, n) - today) / 365.25;
+    const v = vol_year * vol_year + vol_drift * vol_drift * (t0 + (t1 - t0) / 3);
+    const e = sum(idx.map((i) => real[i])) + other * n / 12;
+    const f = level * n / 12, c = capLevel * n / 12, df = (1 + discount) ** -t1;
+    let put, call, chance;
+    if (e > 0) {
+      put = black76(e, f, 1.0, Math.sqrt(v), 0.0, "put");
+      call = black76(e, c, 1.0, Math.sqrt(v), 0.0, "call");
+      chance = f <= 0 ? 0.0 : v <= 0 ? (f > e ? 1.0 : 0.0) : N(-(Math.log(e / f) - v / 2) / Math.sqrt(v));
+    } else { put = Math.max(f, 0.0); call = 0.0; chance = f > 0 ? 1.0 : 0.0; }   // nothing expected: it pays in full
+    years.push({ from: first, months: n, expected: e, floor: f, sd: Math.sqrt(v), chance, payout: put, df, pv_put: df * put, pv_call: df * call });
+  }
+  const pvPut = sum(years.map((y) => y.pv_put)), pvCall = sum(years.map((y) => y.pv_call));
+  const annuity = sum(years.map((y) => y.df * y.months / 12));
+  const fairFee = pvPut / annuity, shareFair = pvCall > 0 ? pvPut / pvCall : null;
+  return { start: tm.start, months, expected, level, cap_level: capLevel, fair_fee: fairFee, fee: fairFee * (1 + margin),
+    share_fair: shareFair, share: shareFair != null ? shareFair * (1 + margin) : null,
+    chance: sum(years.map((y) => y.chance * y.months)) / months, pv_put: pvPut, pv_call: pvCall, years };
 }

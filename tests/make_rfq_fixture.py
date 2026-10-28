@@ -92,13 +92,22 @@ for name, mode, start, months, growth, kind, args in [
     ("toll 4h, beyond the quotes", "additive", dt.date(2028, 7, 1), 24, 0.03, "toll", dict(hours=4, cycles=1)),
 ]:
     cv, assumed = rfq.tenor_curve(QUOTES, "DE", STATS, YEARS, mode, start, months, growth)
+    floors = []
     if kind == "ppa":
         res = rfq.ppa(cv, DOCS, STATS, YEARS, start=start, months=months, today=TODAY, **args)
     else:
         res = rfq.toll(cv, DOCS, YEARS, start=start, months=months, today=TODAY, **args)
+        # the same battery under a revenue floor instead of a toll
+        tech = {k: args[k] for k in ("hours", "round_trip", "cycles") if k in args}
+        terms = {k: v for k, v in args.items() if k not in tech and k not in ("risk", "margin")}
+        tm = rfq.toll_months(cv, DOCS, YEARS, start=start, months=months, today=TODAY, **tech)
+        for fa in (dict(floor=0.7, vol_year=0.25, vol_drift=0.1, cap=1.0, margin=0.15),
+                   dict(floor=0.85, vol_year=0.4, vol_drift=0.0, cap=1.3, margin=0.0),
+                   dict(floor=0.0, vol_year=0.0, vol_drift=0.0, cap=0.5, margin=0.1)):
+            floors.append({"args": {**terms, **fa}, "result": iso(rfq.floor_value(tm, today=TODAY, **terms, **fa))})
     cases.append({"name": name, "mode": mode, "start": start.isoformat(), "months": months, "growth": growth,
                   "kind": kind, "args": args, "assumed": [{"product": q.product, "base": q.base} for q in assumed],
-                  "curve_months": len(cv.months), "result": iso(res)})
+                  "curve_months": len(cv.months), "result": iso(res), "floors": floors})
 
 rnd = random.Random(11)
 days = [[round(rnd.uniform(-60, 220), 2) for _ in range(24)] for _ in range(12)]

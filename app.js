@@ -1004,6 +1004,7 @@ const RFQ_DEFAULTS = {
   deal: "solar", start: "", ppaYears: "10", tollYears: "7", growth: "2", discount: "5",
   ppaMw: "50", yields: {}, pvDeg: "0.5", windDeg: "0", neg: "paid", trend: "0", balSolar: "2", balWind: "3", ppaRisk: "1.5", ppaMargin: "1",
   bessMw: "50", bh: "2", cycles: "1", rt: "85", avail: "97", bessDeg: "2", realism: "70", other: "0", strend: "0", tollRisk: "10", tollMargin: "5",
+  structure: "toll", floorPct: "70", volYear: "25", volDrift: "10", capPct: "100", floorMargin: "15",
 };
 const rfqCfg = () => ({ ...RFQ_DEFAULTS, ...(cfg.rfq || {}) });
 const saveRfq = (patch) => saveCfg({ rfq: { ...rfqCfg(), ...patch } });
@@ -1042,6 +1043,16 @@ function captureTrend(stats, kind) {
   return { from: ys[0], to: ys[ys.length - 1], slope: 100 * sxy / sxx };
 }
 
+// How much a battery's yearly value has swung in history: the standard deviation of year-on-year log changes.
+function batterySwing(stats, hours) {
+  const ys = Object.keys(stats.years).map(Number).sort((a, b) => a - b)
+    .filter((y) => stats.years[y].full && stats.years[y].battery?.[String(hours)]?.year > 0);
+  if (ys.length < 4) return null;
+  const ch = ys.slice(1).map((y, i) => Math.log(stats.years[y].battery[String(hours)].year / stats.years[ys[i]].battery[String(hours)].year));
+  const m = ch.reduce((a, b) => a + b, 0) / ch.length;
+  return { from: ys[0], to: ys[ys.length - 1], sd: Math.sqrt(ch.reduce((a, c) => a + (c - m) ** 2, 0) / (ch.length - 1)) };
+}
+
 const rfqMemo = { curveKey: null, curve: null, monthsKey: null, months: null };
 
 function viewRfq() {
@@ -1078,15 +1089,25 @@ function viewRfq() {
 
   let form;
   if (deal === "toll") {
+    const floorOn = rc.structure === "floor";
+    const swing = stats ? batterySwing(stats, [1, 2, 4].includes(+rc.bh) ? +rc.bh : 2) : null;
     form = [
       h("div", { class: "filters" },
+        seg("Structure", [{ value: "toll", label: "Toll" }, { value: "floor", label: "Revenue floor" }], floorOn ? "floor" : "toll", (v) => { saveRfq({ structure: v }); render(); }),
         seg("Duration", [{ value: "1", label: "1 hour" }, { value: "2", label: "2 hours" }, { value: "4", label: "4 hours" }], String(rc.bh), (v) => { saveRfq({ bh: v }); render(); }),
         seg("Cycles", [{ value: "1", label: "1 cycle a day" }, { value: "2", label: "2 cycles a day" }], String(rc.cycles), (v) => { saveRfq({ cycles: v }); render(); })),
       h("div", { class: "form-grid even" },
         startField, field("Years", "tollYears"), field("Power, MW", "bessMw"), field("Round trip, %", "rt"), field("Availability, %", "avail"),
         field("Degradation, % a year", "bessDeg"), field("Extrinsic captured, %", "realism", { hint: "trading never sees tomorrow" }),
         field("Other revenue, €/MW a year", "other", { hint: "ancillary, intraday: your own figure" }), field("Spread trend, % a year", "strend", { hint: "more batteries, flatter days" }),
-        field("Risk premium, %", "tollRisk"), field("Margin, %", "tollMargin"), field("Prices past the curve, % a year", "growth"), field("Discount rate, %", "discount")),
+        ...(floorOn ? [
+          field("Floor, % of expected revenue", "floorPct"),
+          field("A year's own surprise, %", "volYear", { hint: swing ? `history ${swing.from}–${String(swing.to).slice(2)}: years moved ±${pct(swing.sd, 0)}, crisis included` : "weather, fuel, outages" }),
+          field("Drift of the level, % a year", "volDrift", { hint: "fuel prices, what gets built" }),
+          field("Upside threshold, % of expected", "capPct", { hint: "for paying with a share instead" }),
+          field("Margin, % of the fee", "floorMargin"),
+        ] : [field("Risk premium, %", "tollRisk"), field("Margin, %", "tollMargin")]),
+        field("Prices past the curve, % a year", "growth"), field("Discount rate, %", "discount")),
     ];
   } else {
     const tr = stats ? captureTrend(stats, deal) : null;
@@ -1143,11 +1164,20 @@ function viewRfq() {
         const hours = [1, 2, 4].includes(+c.bh) ? +c.bh : 2, cycles = +c.cycles === 2 ? 2 : 1, rt = clamp(numOr(c.rt, 85) / 100, 0.5, 1);
         const key = `${curveKey}|toll|${hours}|${cycles}|${rt}|${docKey}`;
         if (rfqMemo.monthsKey !== key) { rfqMemo.months = rfq.tollMonths(cv, docs, years, { start, months, hours, round_trip: rt, cycles, today }); rfqMemo.monthsKey = key; }
-        const r = rfq.tollValue(rfqMemo.months, {
-          availability: clamp(numOr(c.avail, 97) / 100, 0, 1), degradation: clamp(numOr(c.bessDeg, 2) / 100, 0, 0.5),
-          realism: clamp(numOr(c.realism, 70) / 100, 0, 1), other: numOr(c.other, 0), trend: numOr(c.strend, 0) / 100,
-          risk: clamp(numOr(c.tollRisk, 10) / 100, 0, 0.9), margin: clamp(numOr(c.tollMargin, 5) / 100, 0, 0.9), discount, today });
-        out.replaceChildren(...tollResult(r, { mw: numOr(c.bessMw, 50), hours, cycles, assumed, cv, stats, zone }));
+        const terms = { availability: clamp(numOr(c.avail, 97) / 100, 0, 1), degradation: clamp(numOr(c.bessDeg, 2) / 100, 0, 0.5),
+          realism: clamp(numOr(c.realism, 70) / 100, 0, 1), other: numOr(c.other, 0), trend: numOr(c.strend, 0) / 100, discount, today };
+        if (c.structure === "floor") {
+          const f = rfq.floorValue(rfqMemo.months, { ...terms, floor: clamp(numOr(c.floorPct, 70) / 100, 0, 2),
+            vol_year: clamp(numOr(c.volYear, 25) / 100, 0, 3), vol_drift: clamp(numOr(c.volDrift, 10) / 100, 0, 3),
+            cap: clamp(numOr(c.capPct, 100) / 100, 0, 10), margin: clamp(numOr(c.floorMargin, 15) / 100, 0, 5) });
+          const kids = floorResult(f, { mw: numOr(c.bessMw, 50), margin: numOr(c.floorMargin, 15) / 100, assumed, cv });
+          out.replaceChildren(...kids.nodes);
+          kids.draw();
+        } else {
+          const r = rfq.tollValue(rfqMemo.months, { ...terms,
+            risk: clamp(numOr(c.tollRisk, 10) / 100, 0, 0.9), margin: clamp(numOr(c.tollMargin, 5) / 100, 0, 0.9) });
+          out.replaceChildren(...tollResult(r, { mw: numOr(c.bessMw, 50), hours, cycles, assumed, cv, stats, zone }));
+        }
       } else {
         const key = `${curveKey}|${deal}|${docKey}`;
         if (rfqMemo.monthsKey !== key) { rfqMemo.months = rfq.ppaMonths(cv, docs, stats, years, { kind: deal, start, months, today }); rfqMemo.monthsKey = key; }
@@ -1163,9 +1193,9 @@ function viewRfq() {
   }
 
   const head = section("rfq-head", kicker("Pricing a deal against your curve"), h("h1", { class: "headline", text: "RfQ" }),
-    h("p", { class: "lede", text: "What you could offer for a solar or wind PPA or a battery toll, built step by step from the forward curve on the Curve tab and from how each history year behaved around it." }),
+    h("p", { class: "lede", text: "What you could offer for a solar or wind PPA, a battery toll or a floor on a battery's revenue, built step by step from the forward curve on the Curve tab and from how each history year behaved around it." }),
     h("div", { class: "filters" }, h("label", { class: "inline-field" }, h("span", { text: "Zone" }), zoneSel),
-      seg("Deal", [{ value: "solar", label: "Solar PPA" }, { value: "wind", label: "Wind PPA" }, { value: "toll", label: "Battery toll" }], deal,
+      seg("Deal", [{ value: "solar", label: "Solar PPA" }, { value: "wind", label: "Wind PPA" }, { value: "toll", label: "Battery" }], deal,
         (v) => { saveRfq({ deal: v }); render(); })),
     h("p", { class: "note" }, quotes.length ? `Prices: your ${quotes.length} quote${quotes.length > 1 ? "s" : ""} for ${zone}, shaped ${cc.mode === "additive" ? "in fixed €/MWh" : "to scale with price"}. ` : "",
       h("a", { class: "linkish", href: "#/curve" }, quotes.length ? "Edit them on the Curve tab" : "Type quotes on the Curve tab")),
@@ -1238,6 +1268,52 @@ function tollResult(r, { mw, hours, cycles, assumed, cv, stats }) {
     h("p", { class: "note", text: "€ per MW. Perfect foresight is the average of the history years (range: each year on its own). Expected keeps the intrinsic value and the captured share of the extrinsic, after availability, degradation and the trend, plus other revenue: before risk and margin." })));
   kids.push(scenarioBlock(r.scenarios.map((s) => ({ year: s.year, v: s.value })), runningBefore(r.steps, "risk"), eur, "€ per MW a year", stats));
   return kids;
+}
+
+// A revenue floor: one put a year on the battery's revenue. Returns the nodes and a draw() for the chart,
+// which needs to be in the page to measure its width.
+function floorResult(f, { mw, margin, assumed, cv }) {
+  const E = f.expected, F = f.level, C = f.cap_level;
+  const shareOk = f.share != null && f.share <= 1;
+  const janStart = ymd(f.start).m === 1;
+  const eurK = (v) => `€${tick(v)}`;
+  const box = h("div", { class: "chart-box" });
+  const shareStat = f.share == null || F <= 0 ? stat("Or, no fee", "—", "nothing to pay for")
+    : shareOk ? stat("Or, no fee", pct(f.share, 0), `of revenue above ${eur(C)}`)
+      : stat("Or, no fee", "Not enough", `even all revenue above ${eur(C)} wouldn't pay for it`);
+  const rows = f.years.map((y) => h("tr", null, h("th", { scope: "row", text: contractLabel(y.from, janStart) + (y.months < 12 ? ` (${y.months} months)` : "") }),
+    num(eur(y.expected)), num(eur(y.floor), "wide"), num(pct(y.sd, 0), "wide"), num(pct(y.chance, 0)), num(eur(y.payout))));
+  const nodes = [
+    h("div", { class: "rfq-block" },
+      h("div", { class: "stats" },
+        stat("Floor", eur(F), `per MW a year, ${pct(E > 0 ? F / E : 0, 0)} of ${eur(E)} expected`),
+        stat("Fair fee", eur(f.fair_fee), "a year: the strip of puts"),
+        stat("Fee offer", eur(f.fee), `a year with ${pct(margin, 0)} margin; ${eur(f.fee * mw)} for ${upTo2.format(mw)} MW`),
+        stat("Chance it pays", pct(f.chance, 0), "in an average year"),
+        shareStat),
+      h("h2", { class: "h2", text: "What the floor pays you, net" }), box,
+      h("p", { class: "note", text: `A floor at ${eur(F)}: after any year whose revenue R ends below it, the provider pays the difference, max(F − R, 0). That's a put on R struck at F, one for every year of the contract: the hockey stick above, shifted down by what it costs. You keep R, so you end the year with max(R, F), like holding a stock with a put on it. The battery itself holds a call on every day's spread, so the floor is a put on a basket of calls: it pays out in calm years, when days are flat, gas is cheap or many batteries share the spreads.` }),
+      h("p", { class: "note", text: "Each year's revenue is lognormal around what's expected of it. Its uncertainty has two parts: the year's own surprise, which doesn't depend on how far away the year is, and a drift in the level that grows with time and, since revenue is earned through the year, counts like an average: σ² + σ_drift²·(t + T/3). Each year is then a Black-76 put, as on the Options tab." }),
+      h("p", { class: "note", text: shareOk
+        ? `Instead of a fee you can give the provider ${pct(f.share, 1)} of revenue above ${eur(C)}: that's selling it a call. Floor plus share is a collar, and it costs nothing upfront when share × Call(threshold) = Put(floor).`
+        : "Instead of a fee you could give the provider a share of revenue above the threshold: that's selling it a call, and floor plus share is a collar. Here the calls above the threshold are worth less than the puts, so no share would cover it: lower the threshold or the floor." }),
+      assumedNote(assumed, cv, pct(numOr(rfqCfg().growth, 2) / 100, 1))),
+    h("div", { class: "rfq-block" }, h("h2", { class: "h2", text: "Year by year" }),
+      table(["Year", "Expected", h("th", { class: "wide", text: "Floor" }), h("th", { class: "wide", text: "Uncertainty" }), "Chance it pays", "Expected payout"], rows, { cls: "wrap", caption: "The floor year by year, € per MW" }),
+      h("p", { class: "note", text: "€ per MW. Expected revenue is the toll's, before its risk premium and margin. The floor is the same every year while expected revenue falls with degradation and the trend, so later years sit closer to it, and they are less certain too. Uncertainty is the standard deviation of the year's log revenue; the fee spreads the present value of the payouts evenly over the years." })),
+  ];
+  const draw = () => requestAnimationFrame(() => {
+    // the payoff, net of what the floor costs: a put's hockey stick, shifted down by the fee, or a collar
+    const xs = Array.from({ length: 121 }, (_, i) => (2.2 * Math.max(E, F) * i) / 120);
+    const series = [{ name: "Paying the fee", values: xs.map((x) => Math.max(F - x, 0) - f.fee), color: "var(--s-1)" }];
+    if (shareOk && f.share > 0) series.push({ name: `Sharing ${pct(f.share, 0)} above ${eurK(C)}`, values: xs.map((x) => Math.max(F - x, 0) - f.share * Math.max(x - C, 0)), color: "var(--s-2)" });
+    lineChart(box, { x: xs, xFmt: eurK, xName: "Without a floor", fmt: eur, tickFmt: eurK, height: 180, zero: true, rest: E,
+      xTitle: "A year's revenue without the floor, € per MW", series,
+      marks: [{ x: F, label: `Floor ${eurK(F)}` }, { x: E, label: `Expected ${eurK(E)}` }],
+      label: "What the floor pays, net of its cost, against the year's revenue" });
+    if (series.length > 1) box.appendChild(legend(series.map((x) => ({ name: x.name, color: x.color }))));
+  });
+  return { nodes, draw };
 }
 
 // The bridge's running total just before the step `key` (what risk and margin are taken from).
