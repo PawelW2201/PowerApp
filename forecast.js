@@ -5,8 +5,9 @@ import { parseIso, weekday, isoDate, todayIn, zonedToUtc } from "./calendar.js";
 
 export const ZONE = "HU";
 export const TZ = "Europe/Budapest";
-export const MODELS = ["lear", "lear_nores", "fr", "naive"];      // PowerDesk's names, best first
-export const MODEL_NAME = { lear: "LEAR", lear_nores: "LEAR without wind and solar", fr: "Residual-load regression", naive: "Naive" };
+export const MODELS = ["lear", "lear_hu", "lear_nores", "fr", "naive"];      // PowerDesk's names, best first
+export const MODEL_NAME = { lear: "LEAR", lear_hu: "LEAR on Hungary's inputs", lear_nores: "LEAR without wind and solar",
+  fr: "Residual-load regression", naive: "Naive" };
 // The delivery day's inputs PowerDesk flags as out or not when it forecasts.
 export const INPUTS = [
   { key: "load", zone: "HU", what: "load" }, { key: "wind", zone: "HU", what: "wind" }, { key: "solar", zone: "HU", what: "solar" },

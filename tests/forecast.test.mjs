@@ -11,7 +11,7 @@ const run = (name) => fx.runs.find((r) => r.name === name);
 const close = (a, b, where, tol = 1e-9) => assert.ok(Math.abs(a - b) <= tol * Math.max(1, Math.abs(b)), `${where}: ${a} vs ${b}`);
 
 test("the fixture has the live cycle's stages", () => {
-  assert.deepEqual(fx.runs.map((r) => r.name), ["first forecast", "no solar yet", "scored", "final"]);
+  assert.deepEqual(fx.runs.map((r) => r.name), ["first forecast", "no solar yet", "scored", "germany late", "final"]);
   for (const r of fx.runs) for (const m of Object.keys(r.summary.latest.forecasts)) assert.ok(MODELS.includes(m) && MODEL_NAME[m], m);
 });
 
@@ -36,11 +36,12 @@ test("errors are PowerDesk's scores, for every model of every scored day", () =>
 test("the record matches PowerDesk's running totals", () => {
   const s = run("final").summary;
   const r = record(s.days);
-  assert.equal(r.days, 3);
+  assert.equal(r.days, 4);
   close(r.main, s.totals.main.mae, "main");
   close(r.naive, s.totals.naive.mae, "naive");
   close(r.ratio, s.totals.main.mae / s.totals.naive.mae, "ratio");
-  assert.equal(r.model, 2, "a day the naive was the forecast isn't the model's");
+  assert.equal(r.model, 3, "a day the naive was the forecast isn't the model's");
+  assert.deepEqual(s.days.map((d) => d.main), ["naive", "lear_hu", "lear", "lear"]);
   const wins = s.days.filter((d) => d.main !== "naive" && d.mae[d.main] < d.mae.naive).length;
   assert.equal(r.wins, wins);
   assert.equal(record([]), null);
@@ -84,6 +85,9 @@ test("which inputs were out, by zone", () => {
   const dark = inputsByZone(run("no solar yet").summary.latest.inputs);
   assert.equal(run("no solar yet").summary.latest.main, "lear_nores");
   assert.deepEqual(dark.missing, { HU: ["solar"], DE: [] });
+  const late = run("germany late").summary.latest;
+  assert.equal(late.main, "lear_hu");
+  assert.deepEqual(inputsByZone(late.inputs).missing, { HU: [], DE: ["load", "wind", "solar"] });
   const none = inputsByZone(run("final").summary.latest.inputs);
   assert.deepEqual(none.out, { HU: [], DE: [] });
   assert.deepEqual(inputsByZone(undefined).missing.DE, ["load", "wind", "solar"]);
