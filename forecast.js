@@ -5,9 +5,11 @@ import { parseIso, weekday, isoDate, todayIn, zonedToUtc } from "./calendar.js";
 
 export const ZONE = "HU";
 export const TZ = "Europe/Budapest";
-export const MODELS = ["lear", "lear_hu", "lear_nores", "fr", "naive"];      // PowerDesk's names, best first
-export const MODEL_NAME = { lear: "LEAR", lear_hu: "LEAR on Hungary's inputs", lear_nores: "LEAR without wind and solar",
-  fr: "Residual-load regression", naive: "Naive" };
+export const MODELS = ["ens", "ens_hu", "lear", "lear_hu", "lear_nores", "fr", "naive"];      // PowerDesk's names, best first
+export const MODEL_NAME = { ens: "LEAR + XGBoost", ens_hu: "LEAR + XGBoost on Hungary's inputs", lear: "LEAR",
+  lear_hu: "LEAR on Hungary's inputs", lear_nores: "LEAR without wind and solar", fr: "Residual-load regression", naive: "Naive" };
+// The same model with every input: what one run without some of them gives up.
+export const FULL = { ens_hu: "ens", lear_hu: "lear", lear_nores: "lear" };
 // The delivery day's inputs PowerDesk flags as out or not when it forecasts.
 export const INPUTS = [
   { key: "load", zone: "HU", what: "load" }, { key: "wind", zone: "HU", what: "wind" }, { key: "solar", zone: "HU", what: "solar" },

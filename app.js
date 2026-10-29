@@ -8,7 +8,7 @@ import * as idm from "./intraday.js";
 import * as fcm from "./forecast.js";
 import { MARKETS, getMarket, delivery, strip, todayIn, isoDate, parseIso, ymd, dayNum, weekday, baseHours, isHoliday, zonedToUtc, localParts, parse, MONTH_ABBR } from "./calendar.js";
 
-const VERSION = "0.11.1";
+const VERSION = "0.12.0";
 const STORE = "powerapp.v1";
 const DATA_CACHE = "pa-data-v1";
 const DEFAULT_BRANCH = "dashboard-data";
@@ -2154,10 +2154,11 @@ function fcNext(L, st, now, d) {
     status = `For now this is the naive forecast, the prices of ${dayName(from.day, true)} again: when it was made, at ${budWhen(L.made_utc, now)}, ${missingNow}. ${then}`;
   }
   else status = `Made at ${budWhen(L.made_utc, now)} by ${fcName(main)}. The auction closes at ${budWhen(L.gate_utc, now)}, in ${inTime(gate - now)}: the last forecast made before then is the one scored.`;
+  const full = fcm.FULL[main];
   const inputsNote = holder ? null
-    : main === "lear" ? "Every input was out: Hungary's and Germany's load, wind and solar forecasts for the day."
+    : !w.nMissing ? "Every input was out: Hungary's and Germany's load, wind and solar forecasts for the day."
     : `${w.missing[0].toUpperCase()}${w.missing.slice(1)} ${w.verb} out yet, so this is ${fcName(main)}` +
-      (bt && bt.lear && bt[main] ? ` (in the backtest it missed by ${p2(bt[main].mae)} €/MWh a quarter-hour, LEAR by ${p2(bt.lear.mae)}).` : ".");
+      (bt && full && bt[main] && bt[full] ? ` (in the backtest it missed by ${p2(bt[main].mae)} €/MWh a quarter-hour; with every input, by ${p2(bt[full].mae)}).` : ".");
   const box = h("div", { class: "chart-box" });
   const series = [...(holder ? [] : [{ name: "Forecast", values: f, color: FC_COLOR.main }]), ...(nv ? [{ name: "Naive", values: nv, color: FC_COLOR.naive }] : [])];
   stepChart(box, { t: fcm.clockAxis(day), step: 900, tz: "UTC", series, fmt: p2, tickFmt: tick, height: 170,
@@ -2263,18 +2264,19 @@ function fcBacktest(d) {
   if (!b || !b.models || !b.models.naive) return null;
   const range = `${dayName(b.start, true)} ${ymd(parseIso(b.start)).y} to ${dayName(b.end, true)} ${ymd(parseIso(b.end)).y}`;
   const rows = fcm.MODELS.filter((m) => b.models[m]).map((m) => h("tr", null, h("th", { scope: "row", text: fcName(m) }), num(p2(b.models[m].mae)), num(nf2.format(b.models[m].rmae))));
-  const lear = b.models.lear;
+  const { lear, ens, ens_hu: ensHu } = b.models;
+  const best = ens && lear ? ` LEAR + XGBoost missed by ${p2(ens.mae)} €/MWh a quarter-hour on average${ensHu ? ` (${p2(ensHu.mae)} on Hungary's inputs alone)` : ""}, LEAR by ${p2(lear.mae)}, the naive by ${p2(b.models.naive.mae)}.`
+    : lear ? ` LEAR missed by ${p2(lear.mae)} €/MWh a quarter-hour on average, the naive by ${p2(b.models.naive.mae)}.` : "";
   return section("fc-bt", kicker("For scale"), h("h2", { class: "h2", text: "The backtest" }),
-    h("p", { class: "lede", text: `Every model forecast every day from ${range} (${int(b.days)} days) as it runs live, refitted each day on the year before.` +
-      (lear ? ` LEAR missed by ${p2(lear.mae)} €/MWh a quarter-hour on average, the naive by ${p2(b.models.naive.mae)}.` : "") }),
+    h("p", { class: "lede", text: `Every model forecast every day from ${range} (${int(b.days)} days) as it runs live, refitted each day on the year before.${best}` }),
     table(["", "MAE, €/MWh", "Relative MAE"], rows, { cls: "wrap", caption: "Each model's errors in the backtest" }),
     h("p", { class: "note", text: "Relative MAE is a model's MAE over the naive's on the same days: below 1 beats it. In the backtest LEAR had the TSOs' wind and solar forecasts every day, though they're only due by 18:00 the day before, after the auction; LEAR without them is what could always have been run." }));
 }
 
 function fcHow() {
   return section("fc-how", h("h2", { class: "h2", text: "How it works" }),
-    h("p", { class: "note", text: "LEAR, after the benchmark of Lago, Marcjasz, De Schutter and Weron (2021): one linear model for each quarter-hour, refitted every day on the year before, with the lasso keeping only the inputs that help (its penalty chosen by AIC). Prices go through an asinh transform around the year's median, so a spike doesn't dominate the fit. The inputs: the same quarter-hour's price a day, two days and a week before; the day before's average, high, low and last quarter-hour; the TSOs' forecasts for the day of Hungary's and Germany's load, wind and solar, and their residual load; the weekday and Hungarian holidays." }),
-    h("p", { class: "note", text: "The forecast that counts is the best version whose inputs are out: LEAR when all of them are; LEAR on Hungary's inputs alone when Germany's forecasts aren't on ENTSO-E yet (some mornings they come later than Hungary's); LEAR without wind and solar when only the load forecasts are; and the naive otherwise, the same quarter-hour a week before for a Monday, Saturday or Sunday, the day before for the rest." }),
+    h("p", { class: "note", text: "The forecast is the average of two models on the same inputs. LEAR, after the benchmark of Lago, Marcjasz, De Schutter and Weron (2021): one linear model for each quarter-hour, refitted every day, with the lasso keeping only the inputs that help (its penalty chosen by AIC) and prices through an asinh transform so a spike doesn't dominate the fit; it's averaged over four calibration windows, the last 56, 91, 182 and 364 days. And XGBoost: gradient-boosted trees, one model for all 96 quarter-hours, refitted every day on the last 364. A linear model extrapolates to spikes it hasn't seen and trees find interactions between the inputs, so each covers part of what the other misses; in the backtest the average beat both." }),
+    h("p", { class: "note", text: "The inputs: the same quarter-hour's price a day, two days and a week before; the day before's average, high, low and last quarter-hour; the TSOs' forecasts for the day of Hungary's and Germany's load, wind and solar, and their residual load; the weekday and Hungarian holidays. Germany's wind and solar forecasts usually reach ENTSO-E after the auction, so most days the forecast runs on Hungary's inputs alone. The forecast that counts is the best version whose inputs are out: the average with every input, else on Hungary's inputs, else LEAR alone, else LEAR without wind and solar, and the naive otherwise: the same quarter-hour a week before for a Monday, Saturday or Sunday, the day before for the rest." }),
     h("p", { class: "note", text: "PowerDesk's epf-live workflow runs at 10:17 and 11:41 Budapest time, before the auction closes at noon, and at 13:47 and 18:17 to score the day the auction priced and start the next. GitHub sometimes runs scheduled workflows late. Prices and forecasts come from ENTSO-E; the auction is SDAC's for the Hungarian zone, in quarter-hours since October 2025." }));
 }
 

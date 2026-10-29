@@ -40,9 +40,9 @@ how European power markets work on public data.
   know. Short spikes are what make waiting pay: a chart shows each way of trading as spikes get longer, bigger or
   more frequent.
 - **Forecast** follows PowerDesk's live forecast of Hungary's day-ahead auction, all 96 quarter-hours. Every morning
-  before the noon auction a LEAR model (a lasso per quarter-hour on the last days' prices, the TSOs' load, wind and
-  solar forecasts for Hungary and Germany, and the calendar, refitted daily on the year before) forecasts the next
-  day; once the auction prints, its prices score the forecast against the naive one (the last comparable day's
+  before the noon auction the average of two models forecasts the next day: LEAR (a lasso per quarter-hour on the
+  last days' prices, the TSOs' load, wind and solar forecasts for Hungary and Germany, and the calendar, averaged
+  over four calibration windows) and XGBoost on the same inputs, both refitted daily; once the auction prints, its prices score the forecast against the naive one (the last comparable day's
   prices again). It shows the next day's forecast with the inputs that were out when it was made, how the last one
   did quarter-hour by quarter-hour, the record since it went live, and the backtest for scale.
 

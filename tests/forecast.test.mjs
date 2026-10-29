@@ -41,7 +41,7 @@ test("the record matches PowerDesk's running totals", () => {
   close(r.naive, s.totals.naive.mae, "naive");
   close(r.ratio, s.totals.main.mae / s.totals.naive.mae, "ratio");
   assert.equal(r.model, 3, "a day the naive was the forecast isn't the model's");
-  assert.deepEqual(s.days.map((d) => d.main), ["naive", "lear_hu", "lear", "lear"]);
+  assert.deepEqual(s.days.map((d) => d.main), ["naive", "ens_hu", "ens", "ens"]);
   const wins = s.days.filter((d) => d.main !== "naive" && d.mae[d.main] < d.mae.naive).length;
   assert.equal(r.wins, wins);
   assert.equal(record([]), null);
@@ -86,7 +86,7 @@ test("which inputs were out, by zone", () => {
   assert.equal(run("no solar yet").summary.latest.main, "lear_nores");
   assert.deepEqual(dark.missing, { HU: ["solar"], DE: [] });
   const late = run("germany late").summary.latest;
-  assert.equal(late.main, "lear_hu");
+  assert.equal(late.main, "ens_hu");
   assert.deepEqual(inputsByZone(late.inputs).missing, { HU: [], DE: ["load", "wind", "solar"] });
   const none = inputsByZone(run("final").summary.latest.inputs);
   assert.deepEqual(none.out, { HU: [], DE: [] });

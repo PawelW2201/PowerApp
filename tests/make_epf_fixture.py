@@ -5,7 +5,7 @@ reference), on made-up days: no market data goes into this public repository.
 
 Four delivery days of the live cycle through the files, as epf-live.yml runs it: the morning
 forecasts before the noon auction (one without Hungary's solar forecast, which comes late), the
-afternoon score and the next day's placeholder, a day whose German forecasts come too late (LEAR
+afternoon score and the next day's placeholder, a day whose German forecasts come too late (the average
 on Hungary's inputs is scored), and a day whose Hungarian load forecast never comes (the naive
 is). The summaries written along the way are what the app reads.
 """
@@ -100,7 +100,7 @@ def main():
         run(at(T2 - DAY, 10, 17), "no solar yet", T1, T2, no_sun)                  # LEAR without wind and solar
         run(at(T2 - DAY, 11, 41), None, T1, T2)                                   # the solar forecast is out: LEAR
         run(at(T2 - DAY, 13, 47), "scored", T2, T2)                               # T2 scored on LEAR, T3's placeholder
-        run(at(T3 - DAY, 10, 17), "germany late", T2, T3, de_late)                # LEAR on Hungary's inputs
+        run(at(T3 - DAY, 10, 17), "germany late", T2, T3, de_late)                # LEAR + XGBoost on Hungary's inputs
         run(at(T3 - DAY, 13, 47), None, T3, T3, de_late)                          # T3 scored on it, T4's placeholder
         run(at(T4 - DAY, 10, 17), None, T3, T4, no_hu_load)                       # no Hungarian load: the naive counts
         run(at(T4 - DAY, 13, 47), "final", T4, T4, no_hu_load)                    # T4 scored, the day after's placeholder
