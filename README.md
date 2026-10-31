@@ -39,12 +39,17 @@ how European power markets work on public data.
   it shows how much better the oracle buys and sells than day-ahead, to calibrate the spikes against a market you
   know. Short spikes are what make waiting pay: a chart shows each way of trading as spikes get longer, bigger or
   more frequent.
-- **Forecast** follows PowerDesk's live forecast of Hungary's day-ahead auction, all 96 quarter-hours. Every morning
-  before the noon auction the average of two models forecasts the next day: LEAR (a lasso per quarter-hour on the
-  last days' prices, the TSOs' load, wind and solar forecasts for Hungary and Germany, and the calendar, averaged
-  over four calibration windows) and XGBoost on the same inputs, both refitted daily; once the auction prints, its prices score the forecast against the naive one (the last comparable day's
-  prices again). It shows the next day's forecast with the inputs that were out when it was made, how the last one
-  did quarter-hour by quarter-hour, the record since it went live, and the backtest for scale.
+- **Forecast** follows PowerDesk's live forecasts of the day-ahead auction for Hungary, Germany, Romania and
+  Bulgaria, all 96 quarter-hours; a switch picks the market. Every morning before the noon auction a model
+  forecasts the next day: for Hungary and Germany the average of a pool of LEAR and XGBoost models and gradient
+  boosting, refitted daily on the last days' prices, the TSOs' forecasts and PowerDesk's own estimates of
+  Germany's load, wind and solar from weather forecasts (Germany's TSOs publish theirs after the auction), with
+  the German gas price; for Romania and Bulgaria gradient boosting on their own data and their neighbours' prices.
+  Hungary's forecast comes with a price range (80% and 50%), from its own recent errors, that adjusts itself after
+  each day it misses. Once the auction prints, its prices score the forecast against the naive one (the last
+  comparable day's prices again), and Hungary's range by how often the price fell inside it. It shows the next
+  day's forecast with the inputs that were out when it was made, how the last one did quarter-hour by
+  quarter-hour, the record since it went live, and Hungary's backtest for scale.
 
 This repository holds **only the app's code**. It contains no data: when you open Today, the app reads
 `summary.json` from the `dashboard-data` branch of your private PowerDesk repository, Curve and RfQ read the
@@ -80,7 +85,7 @@ To install it: in Chrome or Edge use *Install app*; on Android use *Add to Home 
 | `curve.js` | The forward curve; a port of PowerDesk's `powerdesk/curve.py` |
 | `rfq.js` | PPA and toll pricing against the curve; a port of PowerDesk's `powerdesk/rfq.py` |
 | `intraday.js` | The intraday simulator; a port of PowerDesk's `powerdesk/intraday.py` |
-| `forecast.js` | The Forecast tab's arithmetic on the summaries of PowerDesk's live forecast (`powerdesk/epf.py`): stages, errors, the record |
+| `forecast.js` | The Forecast tab's arithmetic on the summaries of PowerDesk's live forecasts (`powerdesk/epf.py`, one per market): stages, errors, the record, and Hungary's price ranges (`powerdesk/bands.py`): coverage and how often they held |
 | `charts.js` | Small charts: step lines for prices and load, a scatter for price against residual load, lines for option values and curves, and the bridge (waterfall) behind an offer |
 | `sw.js` | Offline copy of the app's own files (never touches GitHub data requests) |
 | `manifest.webmanifest`, `icons/` | Install metadata and icons |

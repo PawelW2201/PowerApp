@@ -4,7 +4,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { stage, naiveFrom, dayStats, errors, record, inputsByZone, nextRun, slot, clockAxis, MODELS, MODEL_NAME } from "../forecast.js";
+import { stage, naiveFrom, dayStats, errors, record, inputsByZone, nextRun, slot, clockAxis, MODELS, MODEL_NAME,
+  band, coverage, bandRecord, ZONES, ZONE_CODES, INPUTS_OF } from "../forecast.js";
 
 const fx = JSON.parse(readFileSync(new URL("./epf-fixture.json", import.meta.url)));
 const run = (name) => fx.runs.find((r) => r.name === name);
@@ -112,14 +113,64 @@ test("clock labels and the chart's axis", () => {
   assert.equal(new Date(t[95] * 1000).toISOString(), "2026-10-25T23:45:00.000Z");
 });
 
-test("the next scheduled run, Budapest time", () => {
-  // 21:39 in Budapest on Wed 28 Oct (CET): the next is 10:17 on Thursday
+test("the next scheduled run, Budapest time (release 4.1's: 10:05, 11:20, 16:00)", () => {
+  // 21:39 in Budapest on Wed 28 Oct (CET): the next is 10:05 on Thursday
   let r = nextRun(Date.parse("2026-10-28T20:39:00Z"));
-  assert.equal(new Date(r.at).toISOString(), "2026-10-29T09:17:00.000Z");
-  // 11:00 in summer (CEST): the 11:41 run
+  assert.equal(new Date(r.at).toISOString(), "2026-10-29T09:05:00.000Z");
+  // 11:00 in summer (CEST): the 11:20 run
   r = nextRun(Date.parse("2026-06-10T09:00:00Z"));
-  assert.equal(new Date(r.at).toISOString(), "2026-06-10T09:41:00.000Z");
+  assert.equal(new Date(r.at).toISOString(), "2026-06-10T09:20:00.000Z");
+  // after the auction: the 16:00 run that scores it
+  r = nextRun(Date.parse("2026-11-02T11:30:00Z"));
+  assert.equal(new Date(r.at).toISOString(), "2026-11-02T15:00:00.000Z");
   // just after the last run of the day
-  r = nextRun(Date.parse("2026-06-10T16:17:30Z"));
-  assert.equal(new Date(r.at).toISOString(), "2026-06-11T08:17:00.000Z");
+  r = nextRun(Date.parse("2026-06-10T14:00:30Z"));
+  assert.equal(new Date(r.at).toISOString(), "2026-06-11T08:05:00.000Z");
+});
+
+// ------------------------------------------------------------------ ranges and other zones
+// tests/epf-bands-fixture.json: made-up days through powerdesk/bands.py and epf.summary
+// (tests/make_epf_bands_fixture.py), as release 6's ranges and release 7's zones write them.
+const bx = JSON.parse(readFileSync(new URL("./epf-bands-fixture.json", import.meta.url)));
+
+test("a range's coverage and width are PowerDesk's scores", () => {
+  for (const d of bx.days) for (const lv of [50, 80, 90]) {
+    const c = coverage(d.quantiles, d.actual, lv);
+    close(c.share, d.scores.coverage[String(lv)], `coverage ${lv}`);
+    close(c.width, d.scores.width[String(lv)], `width ${lv}`);
+  }
+  const b = band(bx.days[0].quantiles, 80);
+  assert.deepEqual(b.lo, bx.days[0].quantiles.q10);
+  assert.deepEqual(b.hi, bx.days[0].quantiles.q90);
+  assert.equal(band(undefined, 80), null);
+  assert.equal(band(bx.days[0].quantiles, 70), null);
+  assert.equal(coverage(null, bx.days[0].actual, 80), null);
+});
+
+test("Hungary's summary carries its ranges, and the record adds up how often they held", () => {
+  const s = bx.summary.HU;
+  assert.ok(band(s.latest.quantiles, 80) && band(s.latest.quantiles, 50), "the newest version's ranges");
+  assert.equal(stage(s.latest, Date.parse(s.updated_utc)), "closed");
+  const L = s.last_scored;
+  close(coverage(L.quantiles, L.actual, 80).share, L.band_scores.coverage["80"], "the last scored day's 80%");
+  const br = bandRecord(s.days);
+  assert.equal(br.days, 3);
+  const mean = (lv) => s.days.reduce((a, d) => a + d.band[lv], 0) / s.days.length;
+  for (const lv of ["50", "80", "90"]) close(br[lv], mean(lv), `record ${lv}`);
+  assert.equal(bandRecord([]), null);
+  assert.equal(bandRecord(fx.runs[0].summary.days), null, "days from before the ranges have none");
+});
+
+test("other zones: their own inputs, names and models", () => {
+  const ro = bx.summary.RO;
+  assert.equal(ro.zone, "RO");
+  assert.equal(ro.days[0].main, "gbm");
+  assert.ok(MODELS.includes("gbm") && MODEL_NAME.gbm && MODELS.includes("pool_c") && MODEL_NAME.pool_c);
+  const r = record(ro.days);
+  close(r.main, ro.totals.main.mae, "Romania's record");
+  close(ro.totals.gbm.mae, ro.totals.main.mae, "the gbm is Romania's model");
+  assert.deepEqual(inputsByZone(ro.latest.inputs, "RO"), { out: { RO: ["load"] }, missing: { RO: ["wind", "solar"] } });
+  assert.deepEqual(inputsByZone({ load: true, wind: true, solar: true }, "DE").missing, { DE: [] });
+  assert.deepEqual(Object.keys(inputsByZone({}, "HU").missing), ["HU", "DE"], "Hungary's include Germany's");
+  for (const z of ZONE_CODES) assert.ok(ZONES[z].name && ZONES[z].tz && INPUTS_OF[z].length >= 3, z);
 });

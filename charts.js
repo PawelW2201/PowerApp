@@ -70,9 +70,10 @@ document.addEventListener("pointerdown", (e) => {
   }
 }, { passive: true });
 
+// lineKey: true for a line's key, false for a dot's, "range" for a shaded range's
 function keyed(name, color, value, lineKey = true) {
   const item = el("span", "ro-item");
-  const key = el("i", lineKey ? "ro-key" : "ro-key dotkey");
+  const key = el("i", lineKey === "range" ? "ro-key rangekey" : lineKey ? "ro-key" : "ro-key dotkey");
   key.style.setProperty("--k", color);
   item.append(key, el("span", null, name));
   if (value != null) item.appendChild(el("b", null, value));
@@ -89,6 +90,8 @@ function keyed(name, color, value, lineKey = true) {
  *  opts.height  plot height in px; the axis band is added on top
  *  opts.zero    keep 0 in the y domain and draw it as a baseline
  *  opts.group   crosshairGroup() shared with stacked charts
+ *  opts.bands   [{ name, lo, hi, color, opacity, quiet }]: shaded ranges between two step series,
+ *               drawn under the lines (a forecast's 80% range), each read out as "lo–hi" unless quiet
  *  opts.label   accessible description
  */
 export function stepChart(container, opts) {
@@ -97,6 +100,7 @@ export function stepChart(container, opts) {
   const fmt = opts.fmt || ((v) => String(v));
   const tickFmt = opts.tickFmt || fmt;
   const series = opts.series;
+  const bands = opts.bands || [];
   const t = opts.t, n = t.length, step = opts.step;
   const H = opts.height || 150, AXIS = 22;
   const root = el("div", "chart");
@@ -127,6 +131,16 @@ export function stepChart(container, opts) {
       } else v = se.values[i];
       left.appendChild(keyed(se.name, se.color, v == null ? "—" : fmt(v)));
     }
+    for (const b of bands) {      // a range reads "lo–hi": at the quarter-hour, or its averages
+      if (b.quiet) continue;
+      let lo, hi;
+      if (i == null) {
+        const ok = b.lo.map((x, k) => x != null && b.hi[k] != null);
+        const avg = (xs) => { const v = xs.filter((x, k) => ok[k]); return v.length ? v.reduce((a, c) => a + c, 0) / v.length : null; };
+        lo = avg(b.lo); hi = avg(b.hi);
+      } else { lo = b.lo[i]; hi = b.hi[i]; }
+      left.appendChild(keyed(b.name, b.color, lo == null || hi == null ? "—" : `${fmt(lo)}–${fmt(hi)}`, "range"));
+    }
     const right = el("span", "ro-date", i == null ? "Average" : `${fmtDayTime(t[i], tz)}–${fmtClock(t[i] + step, tz)}`);
     head.append(left, right);
   }
@@ -137,7 +151,7 @@ export function stepChart(container, opts) {
     if (!n) { readout(null); return; }
     const m = { l: 6, r: 46, t: 8, b: AXIS };
     const pw = W - m.l - m.r, ph = H;
-    const all = series.flatMap((se) => se.values);
+    const all = [...series.flatMap((se) => se.values), ...bands.flatMap((b) => [...b.lo, ...b.hi])];
     const { y0, y1, ticks } = domain(all, { zero: opts.zero || Math.min(...all.filter((v) => v != null)) < 0 });
     const X = (time) => m.l + ((time - t0) / (tEnd - t0)) * pw;
     const Y = (v) => m.t + ph - ((v - y0) / (y1 - y0)) * ph;
@@ -170,6 +184,21 @@ export function stepChart(container, opts) {
       placed.push(c.xx);
       svg("line", { x1: c.xx, x2: c.xx, y1: m.t + ph, y2: m.t + ph + 4, class: "base" }, gx);
       svg("text", { x: c.xx, y: m.t + ph + 16, class: c.day ? "tick strong" : "tick", "text-anchor": "middle" }, gx).textContent = c.text;
+    }
+    // ranges first, under the lines: each run of intervals with both ends is one closed shape,
+    // along the top's steps and back along the bottom's
+    const xEnd = (i) => X(Math.min(t[i] + step, i + 1 < n ? t[i + 1] : tEnd));
+    for (const b of bands) {
+      for (let i = 0; i < n;) {
+        if (b.lo[i] == null || b.hi[i] == null) { i++; continue; }
+        let j = i;
+        while (j + 1 < n && b.lo[j + 1] != null && b.hi[j + 1] != null) j++;
+        let d = "";
+        for (let k = i; k <= j; k++) d += `${k === i ? "M" : "L"}${X(t[k]).toFixed(1)},${Y(b.hi[k]).toFixed(1)}H${xEnd(k).toFixed(1)}`;
+        for (let k = j; k >= i; k--) d += `L${xEnd(k).toFixed(1)},${Y(b.lo[k]).toFixed(1)}H${X(t[k]).toFixed(1)}`;
+        svg("path", { d: `${d}Z`, class: "range", style: `--c:${b.color};--o:${b.opacity ?? 0.16}` }, root2);
+        i = j + 1;
+      }
     }
     // marks: steps that hold for their interval; a gap breaks the line
     for (const se of series) {
@@ -467,10 +496,11 @@ export function lineChart(container, opts) {
   return { root, destroy() { ro.disconnect(); root.remove(); } };
 }
 
-// A legend row: keyed names, always visible under a chart with two or more series.
+// A legend row: keyed names, always visible under a chart with two or more series ({ name, color },
+// with dot: true for a scatter's dots and range: true for a shaded range).
 export function legend(items) {
   const row = el("div", "legend");
-  for (const it of items) row.appendChild(keyed(it.name, it.color, null, !it.dot));
+  for (const it of items) row.appendChild(keyed(it.name, it.color, null, it.range ? "range" : !it.dot));
   return row;
 }
 

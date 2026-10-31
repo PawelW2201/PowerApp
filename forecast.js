@@ -1,22 +1,39 @@
-// forecast.js — the Forecast tab's arithmetic, on PowerDesk's live day-ahead forecast for Hungary
-// (powerdesk/epf.py, which writes epf/live/HU/summary.json to the data branch): where a delivery
-// day stands, its numbers, a forecast's errors as PowerDesk scores them, and the record so far.
+// forecast.js — the Forecast tab's arithmetic, on PowerDesk's live day-ahead forecasts (powerdesk/epf.py,
+// which writes epf/live/<zone>/summary.json to the data branch) for Hungary, Germany, Romania and
+// Bulgaria: where a delivery day stands, its numbers, a forecast's errors as PowerDesk scores them,
+// Hungary's price ranges (powerdesk/bands.py) and how often they held, and the record so far.
 import { parseIso, weekday, isoDate, todayIn, zonedToUtc } from "./calendar.js";
 
 export const ZONE = "HU";
-export const TZ = "Europe/Budapest";
-export const MODELS = ["ens", "ens_hu", "lear", "lear_hu", "lear_nores", "fr", "naive"];      // PowerDesk's names, best first
-export const MODEL_NAME = { ens: "LEAR + XGBoost", ens_hu: "LEAR + XGBoost on Hungary's inputs", lear: "LEAR",
+export const TZ = "Europe/Budapest";             // the auction's and the runs' clock, for every zone
+// The markets PowerDesk forecasts live (powerdesk/zones.py), each on its own delivery day's clock.
+export const ZONES = {
+  HU: { code: "HU", name: "Hungary", of: "Hungary's", tz: "Europe/Budapest", clock: "Budapest" },
+  DE: { code: "DE", name: "Germany", of: "Germany's", tz: "Europe/Berlin", clock: "German" },
+  RO: { code: "RO", name: "Romania", of: "Romania's", tz: "Europe/Bucharest", clock: "Romanian" },
+  BG: { code: "BG", name: "Bulgaria", of: "Bulgaria's", tz: "Europe/Sofia", clock: "Bulgarian" },
+};
+export const ZONE_CODES = ["HU", "DE", "RO", "BG"];
+// PowerDesk's names, best first: a version's main is the first of its zone's list it has.
+export const MODELS = ["pool_c", "pool_hu", "gbm", "ens", "ens_hu", "lear", "lear_hu", "lear_nores", "fr", "naive"];
+export const MODEL_NAME = { pool_c: "Pool + boosting", pool_hu: "The pool", gbm: "Gradient boosting",
+  ens: "LEAR + XGBoost", ens_hu: "LEAR + XGBoost on Hungary's inputs", lear: "LEAR",
   lear_hu: "LEAR on Hungary's inputs", lear_nores: "LEAR without wind and solar", fr: "Residual-load regression", naive: "Naive" };
 // The same model with every input: what one run without some of them gives up.
 export const FULL = { ens_hu: "ens", lear_hu: "lear", lear_nores: "lear" };
-// The delivery day's inputs PowerDesk flags as out or not when it forecasts.
-export const INPUTS = [
-  { key: "load", zone: "HU", what: "load" }, { key: "wind", zone: "HU", what: "wind" }, { key: "solar", zone: "HU", what: "solar" },
-  { key: "load_de", zone: "DE", what: "load" }, { key: "wind_de", zone: "DE", what: "wind" }, { key: "solar_de", zone: "DE", what: "solar" },
-];
-// epf-live.yml's schedule, Budapest time: two forecasts before the noon auction, two runs to score it.
-export const RUNS = [[10, 17], [11, 41], [13, 47], [18, 17]];
+// The delivery day's inputs PowerDesk flags as out or not when it forecasts (epf.inputs_of): the
+// zone's own load, wind and solar, and for Hungary Germany's too.
+const own = (z) => [{ key: "load", zone: z, what: "load" }, { key: "wind", zone: z, what: "wind" }, { key: "solar", zone: z, what: "solar" }];
+export const INPUTS_OF = {
+  HU: [...own("HU"), { key: "load_de", zone: "DE", what: "load" }, { key: "wind_de", zone: "DE", what: "wind" }, { key: "solar_de", zone: "DE", what: "solar" }],
+  DE: own("DE"), RO: own("RO"), BG: own("BG"),
+};
+export const INPUTS = INPUTS_OF.HU;
+// epf-live.yml's schedule since release 4.1, Budapest time: cron-job.org starts two forecasts before
+// the noon auction and one run to score it once its prices are out (GitHub's schedule is a fallback).
+export const RUNS = [[10, 5], [11, 20], [16, 0]];
+// Hungary's price ranges (powerdesk/bands.py): each band's quantiles.
+export const BANDS = { 50: ["q25", "q75"], 80: ["q10", "q90"], 90: ["q05", "q95"] };
 
 const pad = (x) => String(x).padStart(2, "0");
 const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
@@ -77,12 +94,41 @@ export function record(days) {
     model: model.length, wins: model.filter((d) => d.mae[d.main] < d.mae.naive).length };
 }
 
-/** Which of the delivery day's inputs were out when the forecast was made, by zone:
- *  { out: { HU: ["load", …], DE: […] }, missing: { HU: […], DE: […] } }. */
-export function inputsByZone(inputs) {
-  const out = { HU: [], DE: [] }, missing = { HU: [], DE: [] };
-  for (const x of INPUTS) (inputs && inputs[x.key] ? out : missing)[x.zone].push(x.what);
+/** Which of the delivery day's inputs were out when `zone`'s forecast was made, by the zone they
+ *  are of: { out: { HU: ["load", …], DE: […] }, missing: { HU: […], DE: […] } } for Hungary, and
+ *  the zone's own alone for the others ({ out: { RO: […] }, missing: { RO: […] } }). */
+export function inputsByZone(inputs, zone = ZONE) {
+  const list = INPUTS_OF[zone] || INPUTS;
+  const zs = [...new Set(list.map((x) => x.zone))];
+  const out = Object.fromEntries(zs.map((z) => [z, []])), missing = Object.fromEntries(zs.map((z) => [z, []]));
+  for (const x of list) (inputs && inputs[x.key] ? out : missing)[x.zone].push(x.what);
   return { out, missing };
+}
+
+/** A price range from a version's quantiles (powerdesk/bands.py): { lo, hi } for the 50, 80 or 90%
+ *  band, or null if the version has none. */
+export function band(quantiles, level) {
+  const [lo, hi] = BANDS[level] || [];
+  return quantiles && quantiles[lo] && quantiles[hi] ? { lo: quantiles[lo], hi: quantiles[hi] } : null;
+}
+
+/** How a range did on a priced day, as PowerDesk scores it (bands.scores): the share of quarter-
+ *  hours whose price fell inside it, ends included, and its mean width. Null without the range. */
+export function coverage(quantiles, actual, level) {
+  const b = band(quantiles, level);
+  if (!b || !actual) return null;
+  let inside = 0;
+  actual.forEach((y, i) => { if (y >= b.lo[i] && y <= b.hi[i]) inside++; });
+  return { share: inside / actual.length, width: mean(b.hi.map((v, i) => v - b.lo[i])) };
+}
+
+/** How often the ranges held since they went live: each band's coverage averaged over the scored
+ *  days that had ranges (the summary's days[].band), or null before the first. */
+export function bandRecord(days) {
+  const with80 = (days || []).filter((d) => d.band && d.band["80"] != null);
+  if (!with80.length) return null;
+  const avg = (lv) => { const xs = with80.map((d) => d.band[lv]).filter((v) => v != null); return xs.length ? mean(xs) : null; };
+  return { days: with80.length, 50: avg("50"), 80: avg("80"), 90: avg("90") };
 }
 
 /** The next scheduled run after `now` (ms): { at (ms), h, mi, day (day number, Budapest) }. */
