@@ -8,7 +8,8 @@ Two things the app reads beside the live cycle's summaries (make_epf_fixture.py)
               powerdesk.bands.scores (the ranges' coverage and width)
     summary   epf.summary over live records with ranges, the way Hungary's are written since
               release 6 (latest.quantiles, last_scored.band_scores, days[].band), and Romania's,
-              whose model is the gbm alone (release 7)
+              whose model is the gbm alone (release 7), with ranges as another zone's are written once
+              it has them (release 7.5: the same fields)
 """
 import datetime as dt
 import json
@@ -62,10 +63,12 @@ def main():
     hu = epf.summary(records, None, now)
     ro_doc = {"target": "2026-11-02", "versions": [{"target": "2026-11-02", "made_utc": "2026-11-01T09:05:00+00:00",
               "gate_utc": "2026-11-01T11:00:00+00:00", "main": "gbm", "inputs": {"load": True, "solar": False, "wind": False},
-              "forecasts": {"gbm": days[4]["forecast"], "naive": days[5]["forecast"]}}],
+              "forecasts": {"gbm": days[4]["forecast"], "naive": days[5]["forecast"]},
+              "quantiles": days[4]["quantiles"]}],
               "actual": days[4]["actual"]}
     ro_doc["scores"] = {m: {"mae": sum(abs(a - b) for a, b in zip(fc, ro_doc["actual"])) / 96}
                         for m, fc in ro_doc["versions"][0]["forecasts"].items()}
+    bands.score_doc(ro_doc)
     ro = epf.summary([ro_doc], None, now, "RO")
     print(json.dumps({"note": "made-up days through PowerDesk's ranges and summaries; not market data",
                       "days": days, "summary": {"HU": hu, "RO": ro}}, separators=(",", ":")))

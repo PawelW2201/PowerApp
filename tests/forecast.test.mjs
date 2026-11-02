@@ -173,4 +173,17 @@ test("other zones: their own inputs, names and models", () => {
   assert.deepEqual(inputsByZone({ load: true, wind: true, solar: true }, "DE").missing, { DE: [] });
   assert.deepEqual(Object.keys(inputsByZone({}, "HU").missing), ["HU", "DE"], "Hungary's include Germany's");
   for (const z of ZONE_CODES) assert.ok(ZONES[z].name && ZONES[z].tz && INPUTS_OF[z].length >= 3, z);
+  assert.deepEqual(ZONE_CODES, ["HU", "DE", "RO", "BG", "PL"]);
+  assert.equal(ZONES.PL.tz, "Europe/Warsaw");
+  assert.deepEqual(inputsByZone({ load: true, solar: false, wind: false }, "PL"), { out: { PL: ["load"] }, missing: { PL: ["wind", "solar"] } });
+});
+
+test("another zone's ranges read the same way as Hungary's", () => {
+  const ro = bx.summary.RO, L = ro.last_scored;
+  assert.ok(band(L.quantiles, 80) && band(L.quantiles, 50), "Romania's version carries its ranges");
+  close(coverage(L.quantiles, L.actual, 80).share, L.band_scores.coverage["80"], "Romania's 80%");
+  close(coverage(L.quantiles, L.actual, 50).share, L.band_scores.coverage["50"], "Romania's 50%");
+  const br = bandRecord(ro.days);
+  assert.equal(br.days, 1);
+  close(br[80], ro.days[0].band["80"], "Romania's record");
 });

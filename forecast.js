@@ -1,7 +1,8 @@
 // forecast.js — the Forecast tab's arithmetic, on PowerDesk's live day-ahead forecasts (powerdesk/epf.py,
-// which writes epf/live/<zone>/summary.json to the data branch) for Hungary, Germany, Romania and
-// Bulgaria: where a delivery day stands, its numbers, a forecast's errors as PowerDesk scores them,
-// Hungary's price ranges (powerdesk/bands.py) and how often they held, and the record so far.
+// which writes epf/live/<zone>/summary.json to the data branch) for Hungary, Germany, Romania,
+// Bulgaria and Poland: where a delivery day stands, its numbers, a forecast's errors as PowerDesk scores
+// them, the price ranges (powerdesk/bands.py) where a zone has them and how often they held, and the
+// record so far.
 import { parseIso, weekday, isoDate, todayIn, zonedToUtc } from "./calendar.js";
 
 export const ZONE = "HU";
@@ -12,8 +13,9 @@ export const ZONES = {
   DE: { code: "DE", name: "Germany", of: "Germany's", tz: "Europe/Berlin", clock: "German" },
   RO: { code: "RO", name: "Romania", of: "Romania's", tz: "Europe/Bucharest", clock: "Romanian" },
   BG: { code: "BG", name: "Bulgaria", of: "Bulgaria's", tz: "Europe/Sofia", clock: "Bulgarian" },
+  PL: { code: "PL", name: "Poland", of: "Poland's", tz: "Europe/Warsaw", clock: "Polish" },
 };
-export const ZONE_CODES = ["HU", "DE", "RO", "BG"];
+export const ZONE_CODES = ["HU", "DE", "RO", "BG", "PL"];
 // PowerDesk's names, best first: a version's main is the first of its zone's list it has.
 export const MODELS = ["pool_c", "pool_hu", "gbm", "ens", "ens_hu", "lear", "lear_hu", "lear_nores", "fr", "naive"];
 export const MODEL_NAME = { pool_c: "Pool + boosting", pool_hu: "The pool", gbm: "Gradient boosting",
@@ -26,13 +28,13 @@ export const FULL = { ens_hu: "ens", lear_hu: "lear", lear_nores: "lear" };
 const own = (z) => [{ key: "load", zone: z, what: "load" }, { key: "wind", zone: z, what: "wind" }, { key: "solar", zone: z, what: "solar" }];
 export const INPUTS_OF = {
   HU: [...own("HU"), { key: "load_de", zone: "DE", what: "load" }, { key: "wind_de", zone: "DE", what: "wind" }, { key: "solar_de", zone: "DE", what: "solar" }],
-  DE: own("DE"), RO: own("RO"), BG: own("BG"),
+  DE: own("DE"), RO: own("RO"), BG: own("BG"), PL: own("PL"),
 };
 export const INPUTS = INPUTS_OF.HU;
 // epf-live.yml's schedule since release 4.1, Budapest time: cron-job.org starts two forecasts before
 // the noon auction and one run to score it once its prices are out (GitHub's schedule is a fallback).
 export const RUNS = [[10, 5], [11, 20], [16, 0]];
-// Hungary's price ranges (powerdesk/bands.py): each band's quantiles.
+// The price ranges (powerdesk/bands.py), where a zone's forecast has them: each band's quantiles.
 export const BANDS = { 50: ["q25", "q75"], 80: ["q10", "q90"], 90: ["q05", "q95"] };
 
 const pad = (x) => String(x).padStart(2, "0");
